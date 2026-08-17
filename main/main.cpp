@@ -276,14 +276,31 @@ static void start_game(const char* path) {
 static void stop_game() {
     if (!emu_running) return;
 
+    // 1. Sinaliza para TODAS as tasks pararem Imediatamente
+    emu_running = false; 
+
+    // 2. Aguarda a task do emulador (Vídeo/Lógica) terminar de forma segura
+    while (emu_task_handle != NULL) { 
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+
+    // 3. Aguarda a task de áudio terminar de ler o buffer e fechar
+    if (audio_enabled) {
+        while (audio_task_handle != NULL) { 
+            vTaskDelay(pdMS_TO_TICKS(10)); 
+        }
+    }
+
+    // 4. AGORA É SEGURO DELETAR O RINGBUFFER E MUDAR O HARDWARE
     if (audio_enabled) {
         bsp_extra_codec_mute_set(true); 
-        if (audio_ringbuf) { vRingbufferDelete(audio_ringbuf); audio_ringbuf = NULL; }
+        if (audio_ringbuf) { 
+            vRingbufferDelete(audio_ringbuf); 
+            audio_ringbuf = NULL; 
+        }
     }
-    
-    emu_running = false; 
-    while (emu_task_handle != NULL) { vTaskDelay(pdMS_TO_TICKS(10)); }
 
+    // 5. Libera a memória da ROM e dos Buffers de Vídeo
     gnuboy_free_rom();
 
     if (dma_buffer[0]) { heap_caps_free(dma_buffer[0]); dma_buffer[0] = nullptr; }
@@ -291,6 +308,7 @@ static void stop_game() {
     if (gnuboy_fb) { heap_caps_free(gnuboy_fb); gnuboy_fb = nullptr; }
     if (emu_rom_buffer) { heap_caps_free(emu_rom_buffer); emu_rom_buffer = nullptr; }
 
+    // 6. Devolve o controle para a interface Gráfica (Menu)
     if (lvgl_port_lock(pdMS_TO_TICKS(100))) {
         lv_scr_load_anim(scr_menu, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
         lv_obj_invalidate(lv_scr_act()); 
