@@ -6,6 +6,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/ringbuf.h"
 #include "bsp_board_extra.h"
 #include "nvs_flash.h"
 #include "esp_timer.h"
@@ -13,24 +14,20 @@
 #include <string.h>
 #include "display/lv_display_private.h"
 
-extern "C" {
-    #include "gnuboy.h"
-    #include "cpu.h"
-    #include "hw.h"
-    #include "lcd.h"
-
-    // --- STUBS DE ÁUDIO PARA ENGANAR O LINKER ---
-    uint8_t audio_read(uint16_t addr) { return 0xFF; }
-    void audio_write(uint16_t addr, uint8_t val) { }
-    void audio_callback(void *buffer, size_t length) { }
-    void audio_init() { }
-}
+// Variáveis Globais de Áudio
+static bool audio_enabled = true; 
+static RingbufHandle_t audio_ringbuf = NULL;
 
 extern "C" {
     #include "gnuboy.h"
     #include "cpu.h"
     #include "hw.h"
     #include "lcd.h"
+    #include "minigb_apu.h"
+
+    // Ponte real de áudio do Gnuboy
+    uint8_t audio_read(uint16_t addr) { return audio_enabled ? minigb_audio_read(addr) : 0xFF; }
+    void audio_write(uint16_t addr, uint8_t val) { if(audio_enabled) minigb_audio_write(addr, val); }
 }
 
 static const char *TAG = "GBC_OS";
@@ -53,9 +50,27 @@ static lv_obj_t *scr_menu = NULL;
 static lv_obj_t *scr_play = NULL;
 static lv_obj_t *list_roms = NULL;
 
+// Variáveis de Áudio
+static int current_volume = 80;
+static TaskHandle_t audio_task_handle = NULL;
+
 // ==========================================
 // FUNÇÕES DE HARDWARE E LVGL
 // ==========================================
+static void audio_drain_task(void *arg) {
+    size_t bytes_written;
+    while (emu_running && audio_enabled) {
+        size_t item_size;
+        uint8_t *data = (uint8_t *)xRingbufferReceive(audio_ringbuf, &item_size, pdMS_TO_TICKS(100));
+        if (data) {
+            bsp_extra_i2s_write(data, item_size, &bytes_written, portMAX_DELAY);
+            vRingbufferReturnItem(audio_ringbuf, (void *)data);
+        }
+    }
+    audio_task_handle = NULL; 
+    vTaskDelete(NULL);
+}
+
 static void clear_i2c_bus(void) {
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -82,11 +97,13 @@ static void clear_i2c_bus(void) {
 // ==========================================
 static void emulator_task(void* arg) {
     uint32_t last_fps_tick = xthal_get_ccount();
-    uint32_t frames = 0;
+    uint32_t frames_logic = 0;
+    uint32_t frames_draw = 0;
+    uint64_t next_frame_target_us = esp_timer_get_time(); 
 
     while (emu_running) {
         
-        // --- 1. LEITURA DOS BOTÕES VIRTUAIS ---
+        // --- 1. LEITURA DOS BOTÕES ---
         static int gpad = 0; 
         if (lvgl_port_lock(0)) {
             gpad = 0; 
@@ -94,22 +111,17 @@ static void emulator_task(void* arg) {
             if (indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
                 lv_point_t p;
                 lv_indev_get_point(indev, &p);
-                int32_t tx = p.x;
-                int32_t ty = p.y;
-                
-                // Mapeamento invisível na tela
+                int32_t tx = p.x, ty = p.y;
                 if (tx < 100 && ty > 80 && ty < 240) {
                     if (ty < 160) gpad |= GB_PAD_START; 
                     else gpad |= GB_PAD_SELECT;         
-                }
-                else if (tx < 200 && ty > 250) { 
-                    int center_x = 87, center_y = 402; 
-                    if (tx < center_x - 22) gpad |= GB_PAD_LEFT;
-                    else if (tx > center_x + 22) gpad |= GB_PAD_RIGHT;
-                    if (ty < center_y - 22) gpad |= GB_PAD_UP;
-                    else if (ty > center_y + 22) gpad |= GB_PAD_DOWN;
-                }
-                else if (tx >= 200 && ty > 250) {
+                } else if (tx < 200 && ty > 250) { 
+                    int cx = 87, cy = 402; 
+                    if (tx < cx - 22) gpad |= GB_PAD_LEFT;
+                    else if (tx > cx + 22) gpad |= GB_PAD_RIGHT;
+                    if (ty < cy - 22) gpad |= GB_PAD_UP;
+                    else if (ty > cy + 22) gpad |= GB_PAD_DOWN;
+                } else if (tx >= 200 && ty > 250) {
                     if (tx > 310) gpad |= GB_PAD_A; 
                     else gpad |= GB_PAD_B;
                 }
@@ -118,63 +130,84 @@ static void emulator_task(void* arg) {
         }
         gnuboy_set_pad(gpad);
         
-        // --- 2. EXECUTA 1 FRAME LÓGICO ---
-        gnuboy_run(1); 
+        // --- 2. FRAMESKIP (60 Lógica / 30 Visual) ---
+        static uint8_t frame_skip = 0;
+        bool draw_this_frame = ((++frame_skip) % 2 == 0); 
+
+        gnuboy_run(draw_this_frame); 
         
-        // --- 3. RENDERIZAÇÃO DIRETA VIA DMA (UPSCALING 2x) ---
-        for (int chunk = 0; chunk < (144 / CHUNK_LINES); chunk++) {
-            int src_y = chunk * CHUNK_LINES;
+        // --- 3. GERAÇÃO DE ÁUDIO ---
+        if (audio_enabled) {
+            // O assert pede estritamente este cálculo em bytes
+            const int req_sz = AUDIO_SAMPLES * 2 * sizeof(int16_t);
+            static uint8_t sample_buffer[4096]; 
+
+            audio_callback(NULL, sample_buffer, req_sz);
             
-            for (int y = 0; y < CHUNK_LINES; y++) {
-                uint32_t *src_row_32 = (uint32_t*)&gnuboy_fb[(src_y + y) * 160];
-                uint32_t *dst_row1 = (uint32_t*)dma_buffer[current_buf] + (y * 2) * 160;
-                uint32_t *dst_row2 = (uint32_t*)dma_buffer[current_buf] + (y * 2 + 1) * 160;
-
-                for (int x = 0; x < 80; x++) {
-                    uint32_t dual_pixel = src_row_32[x]; 
-                    
-                    uint16_t pix_a = (uint16_t)(dual_pixel & 0xFFFF);
-                    uint16_t pix_b = (uint16_t)(dual_pixel >> 16);
-                    
-                    uint32_t color_a_32 = (pix_a << 16) | pix_a;
-                    uint32_t color_b_32 = (pix_b << 16) | pix_b;
-                    
-                    int dst_idx = x * 2;
-                    dst_row1[dst_idx] = color_a_32;
-                    dst_row1[dst_idx + 1] = color_b_32;
-                    
-                    dst_row2[dst_idx] = color_a_32;
-                    dst_row2[dst_idx + 1] = color_b_32;
-                }
+            if (audio_ringbuf) {
+                // Time-out rápido (2ms) igual ao factory para não travar a DMA de vídeo
+                xRingbufferSend(audio_ringbuf, sample_buffer, req_sz, pdMS_TO_TICKS(2));
             }
+        }
 
-            lv_area_t area;
-            area.x1 = 45; area.y1 = 15 + (chunk * SCALED_CHUNK_LINES);
-            area.x2 = area.x1 + 320 - 1; area.y2 = area.y1 + SCALED_CHUNK_LINES - 1;
+        // --- 4. RENDERIZAÇÃO DE VÍDEO (Pula 1 Quadro) ---
+        if (draw_this_frame) {
+            for (int chunk = 0; chunk < (144 / CHUNK_LINES); chunk++) {
+                int src_y = chunk * CHUNK_LINES;
+                for (int y = 0; y < CHUNK_LINES; y++) {
+                    uint32_t *src_row_32 = (uint32_t*)&gnuboy_fb[(src_y + y) * 160];
+                    uint32_t *dst_row1 = (uint32_t*)dma_buffer[current_buf] + (y * 2) * 160;
+                    uint32_t *dst_row2 = (uint32_t*)dma_buffer[current_buf] + (y * 2 + 1) * 160;
 
-            if (lvgl_port_lock(pdMS_TO_TICKS(10))) {
-                lv_display_t * disp = lv_display_get_default();
-                if (disp && disp->flush_cb) {
-                    disp->flush_cb(disp, &area, (uint8_t*)dma_buffer[current_buf]);
+                    for (int x = 0; x < 80; x++) {
+                        uint32_t dp = src_row_32[x]; 
+                        uint32_t ca = ((dp & 0xFFFF) << 16) | (dp & 0xFFFF);
+                        uint32_t cb = ((dp >> 16) << 16) | (dp >> 16);
+                        int dst_idx = x * 2;
+                        dst_row1[dst_idx] = ca; dst_row1[dst_idx + 1] = cb;
+                        dst_row2[dst_idx] = ca; dst_row2[dst_idx + 1] = cb;
+                    }
                 }
-                lvgl_port_unlock();
+                lv_area_t area = {
+                    .x1 = 45, .y1 = 15 + (chunk * SCALED_CHUNK_LINES),
+                    .x2 = 45 + 320 - 1, .y2 = 15 + (chunk * SCALED_CHUNK_LINES) + SCALED_CHUNK_LINES - 1
+                };
+                if (lvgl_port_lock(pdMS_TO_TICKS(10))) {
+                    lv_display_t * disp = lv_display_get_default();
+                    if (disp && disp->flush_cb) disp->flush_cb(disp, &area, (uint8_t*)dma_buffer[current_buf]);
+                    lvgl_port_unlock();
+                }
+                current_buf = !current_buf; 
             }
-            current_buf = !current_buf; 
-            vTaskDelay(pdMS_TO_TICKS(2)); // Alimenta o Watchdog enquanto o DMA envia a imagem
+            frames_draw++;
         }
         
-        frames++;
+        frames_logic++;
         uint32_t now = xthal_get_ccount();
         if ((now - last_fps_tick) >= 240000000) {  
-            ESP_LOGI(TAG, "Gnuboy FPS: %lu", frames);
-            frames = 0;
+            ESP_LOGI(TAG, "FPS: %lu Lógico / %lu Visual", frames_logic, frames_draw);
+            frames_logic = frames_draw = 0;
             last_fps_tick = now;
         }
 
-        // Descanso perfeito para cravar 60FPS (~16.6ms) sem Busy-Wait!
-        vTaskDelay(pdMS_TO_TICKS(2));
+        // --- 5. MARCAPASSO DOS 60 FPS (16.74ms do Gameboy) ---
+        next_frame_target_us += 16742; 
+        uint64_t current_time_us = esp_timer_get_time();
+        
+        if (current_time_us < next_frame_target_us) {
+            uint32_t delay_us = next_frame_target_us - current_time_us;
+            if (delay_us > 2000) {
+                vTaskDelay(pdMS_TO_TICKS(delay_us / 1000));
+            } else {
+                taskYIELD();
+            }
+        } else {
+            if (current_time_us - next_frame_target_us > 33484) {
+                next_frame_target_us = current_time_us; 
+            }
+            taskYIELD(); 
+        }
     }
-    
     emu_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -185,10 +218,26 @@ static void emulator_task(void* arg) {
 static void start_game(const char* path) {
     if (emu_running) return;
 
-    // Aloca os buffers de vídeo direto na SRAM interna!
+    // Aloca os buffers de vídeo na SRAM interna
     if (!dma_buffer[0]) dma_buffer[0] = (uint16_t*)heap_caps_malloc(320 * SCALED_CHUNK_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!dma_buffer[1]) dma_buffer[1] = (uint16_t*)heap_caps_malloc(320 * SCALED_CHUNK_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!gnuboy_fb) gnuboy_fb = (uint16_t*)heap_caps_malloc(160 * 144 * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    
+    // --- LÓGICA EXATA DO FACTORY FIRMWARE ---
+    if (audio_enabled) {
+        static bool i2s_initialized = false;
+        if (!i2s_initialized) {
+            bsp_extra_codec_init();
+            bsp_extra_codec_set_fs(44100, 16, I2S_SLOT_MODE_STEREO); // Frequência que o DAC aceita
+            i2s_initialized = true;
+        }
+        bsp_extra_codec_mute_set(false);
+        bsp_extra_codec_volume_set(current_volume, NULL);
+        
+        if (!audio_ringbuf) {
+            audio_ringbuf = xRingbufferCreate(8192, RINGBUF_TYPE_BYTEBUF);
+        }
+    }
 
     FILE* f = fopen(path, "rb");
     if (!f) return;
@@ -197,27 +246,40 @@ static void start_game(const char* path) {
     rewind(f);
     
     size_t padded_size = (rom_size + 16383) & ~16383; 
-    
-    // A ROM é a única coisa que vai pra lenta PSRAM (pois pode ter até 4MB)
     emu_rom_buffer = (uint8_t*)heap_caps_calloc(1, padded_size, MALLOC_CAP_SPIRAM);
     fread(emu_rom_buffer, 1, rom_size, f);
     fclose(f);
 
-    ESP_LOGI(TAG, "Iniciando Gnuboy...");
+    ESP_LOGI(TAG, "Iniciando Gnuboy a 44100Hz...");
     
-    // Inicia sem áudio por enquanto
-    if (gnuboy_init(0, GB_AUDIO_STEREO_S16, GB_PIXEL_565_LE, NULL, NULL) != 0) return;
+    // APU MiniGB inicializada AQUI (depois do Codec, antes do Gnuboy)
+    if (audio_enabled) {
+        audio_init();
+    }
+
+    // Inicializa motor Gnuboy em 44100Hz
+    if (gnuboy_init(44100, GB_AUDIO_STEREO_S16, GB_PIXEL_565_LE, NULL, NULL) != 0) return;
 
     gnuboy_set_framebuffer(gnuboy_fb);
     gnuboy_load_rom(emu_rom_buffer, rom_size);
     gnuboy_reset(true);
     
     emu_running = true; 
+    
+    // Inicia as tasks usando os níveis do Factory Firmware
+    if (audio_enabled) { 
+        xTaskCreatePinnedToCore(audio_drain_task, "audio_drain", 4096, NULL, 5, &audio_task_handle, 0); 
+    }
     xTaskCreatePinnedToCore(emulator_task, "emu_task", 16384, NULL, 5, &emu_task_handle, 1);
 }
 
 static void stop_game() {
     if (!emu_running) return;
+
+    if (audio_enabled) {
+        bsp_extra_codec_mute_set(true); 
+        if (audio_ringbuf) { vRingbufferDelete(audio_ringbuf); audio_ringbuf = NULL; }
+    }
     
     emu_running = false; 
     while (emu_task_handle != NULL) { vTaskDelay(pdMS_TO_TICKS(10)); }
@@ -261,32 +323,44 @@ static void build_ui() {
     lv_label_set_text(title, "Game Boy Color");
     lv_obj_set_style_text_color(title, lv_color_white(), 0); 
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 20);
 
+    // --- NOVO: BOTÃO (SWITCH) DE ÁUDIO NO MENU ---
+    lv_obj_t * sw_audio = lv_switch_create(scr_menu);
+    lv_obj_align(sw_audio, LV_ALIGN_TOP_RIGHT, -20, 20);
+    if(audio_enabled) lv_obj_add_state(sw_audio, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw_audio, [](lv_event_t *e) {
+        lv_obj_t * sw = (lv_obj_t *)lv_event_get_target(e);
+        audio_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    }, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    lv_obj_t * lbl_audio = lv_label_create(scr_menu);
+    lv_label_set_text(lbl_audio, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_color(lbl_audio, lv_color_white(), 0);
+    lv_obj_align_to(lbl_audio, sw_audio, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+
+    // LISTA MAIS LARGA
     list_roms = lv_list_create(scr_menu);
-    lv_obj_set_size(list_roms, 320, 360);
+    lv_obj_set_size(list_roms, 400, 380);
     lv_obj_align(list_roms, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_obj_set_style_bg_color(list_roms, lv_color_black(), 0);
     lv_obj_set_style_border_width(list_roms, 0, 0);
 
-    // TELA DE JOGO (BOTÕES INVISÍVEIS)
+    // TELA DE JOGO 
     scr_play = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_play, lv_color_black(), 0);
     lv_obj_remove_flag(scr_play, LV_OBJ_FLAG_SCROLLABLE);
 
+    // --- TODOS OS BOTÕES MANTIDOS NAS CORES E OPACIDADE ORIGINAIS ---
     lv_obj_t *btn_exit = lv_label_create(scr_play);
     lv_label_set_text(btn_exit, LV_SYMBOL_CLOSE);
     lv_obj_set_style_text_color(btn_exit, lv_color_hex(0xFF3333), 0);
     lv_obj_set_style_text_font(btn_exit, &lv_font_montserrat_20, 0);
-    lv_obj_align(btn_exit, LV_ALIGN_TOP_LEFT, 20, 20);
-
+    lv_obj_align(btn_exit, LV_ALIGN_TOP_LEFT, 90, 0);
     lv_obj_add_flag(btn_exit, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(btn_exit, 30); 
-    lv_obj_add_event_cb(btn_exit, [](lv_event_t *e) {
-        stop_game();
-    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_set_ext_click_area(btn_exit, 20); 
+    lv_obj_add_event_cb(btn_exit, [](lv_event_t *e) { stop_game(); }, LV_EVENT_CLICKED, NULL);
 
-    // D-PAD Visível (translúcido)
     lv_obj_t * dpad_v = lv_obj_create(scr_play);
     lv_obj_set_size(dpad_v, 44, 140);
     lv_obj_align(dpad_v, LV_ALIGN_BOTTOM_LEFT, 65, -30);  
@@ -301,7 +375,6 @@ static void build_ui() {
     lv_obj_set_style_border_width(dpad_h, 0, 0);
     lv_obj_set_style_bg_opa(dpad_h, LV_OPA_50, 0);
 
-    // Botões A e B
     lv_obj_t * btn_a = lv_obj_create(scr_play);
     lv_obj_set_size(btn_a, 70, 70);
     lv_obj_align(btn_a, LV_ALIGN_BOTTOM_RIGHT, -20, -100);
@@ -323,6 +396,58 @@ static void build_ui() {
     lv_obj_t * lbl_b = lv_label_create(btn_b);
     lv_label_set_text(lbl_b, "B");
     lv_obj_center(lbl_b);
+
+    lv_obj_t * btn_start = lv_obj_create(scr_play);
+    lv_obj_set_size(btn_start, 40, 30); 
+    lv_obj_align(btn_start, LV_ALIGN_LEFT_MID, 10, -110); 
+    lv_obj_set_style_radius(btn_start, 10, 0);
+    lv_obj_set_style_bg_color(btn_start, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_bg_opa(btn_start, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(btn_start, 0, 0);
+    lv_obj_t * lbl_start = lv_label_create(btn_start);
+    lv_label_set_text(lbl_start, "ST");
+    lv_obj_set_style_text_color(lbl_start, lv_color_hex(0x666666), 0);
+    lv_obj_center(lbl_start);
+
+    lv_obj_t * btn_select = lv_obj_create(scr_play);
+    lv_obj_set_size(btn_select, 40, 30); 
+    lv_obj_align(btn_select, LV_ALIGN_LEFT_MID, 10, -50); 
+    lv_obj_set_style_radius(btn_select, 10, 0);
+    lv_obj_set_style_bg_color(btn_select, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_bg_opa(btn_select, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(btn_select, 0, 0);
+    lv_obj_t * lbl_select = lv_label_create(btn_select);
+    lv_label_set_text(lbl_select, "SL");
+    lv_obj_set_style_text_color(lbl_select, lv_color_hex(0x666666), 0);
+    lv_obj_center(lbl_select);
+
+    lv_obj_t * btn_vol_up = lv_btn_create(scr_play);
+    lv_obj_set_size(btn_vol_up, 35, 35);
+    lv_obj_align(btn_vol_up, LV_ALIGN_TOP_RIGHT, -10, 60);
+    lv_obj_set_style_bg_color(btn_vol_up, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_opa(btn_vol_up, LV_OPA_70, 0);
+    lv_obj_t * lbl_vup = lv_label_create(btn_vol_up);
+    lv_label_set_text(lbl_vup, LV_SYMBOL_VOLUME_MAX);
+    lv_obj_center(lbl_vup);
+    lv_obj_add_event_cb(btn_vol_up, [](lv_event_t *e) {
+        if(!emu_running) return;
+        if (current_volume < 100) current_volume += 10;
+        bsp_extra_codec_volume_set(current_volume, NULL);
+    }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * btn_vol_down = lv_btn_create(scr_play);
+    lv_obj_set_size(btn_vol_down, 35, 35);
+    lv_obj_align(btn_vol_down, LV_ALIGN_TOP_RIGHT, -10, 110);
+    lv_obj_set_style_bg_color(btn_vol_down, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_opa(btn_vol_down, LV_OPA_70, 0);
+    lv_obj_t * lbl_vdown = lv_label_create(btn_vol_down);
+    lv_label_set_text(lbl_vdown, LV_SYMBOL_VOLUME_MID);
+    lv_obj_center(lbl_vdown);
+    lv_obj_add_event_cb(btn_vol_down, [](lv_event_t *e) {
+        if(!emu_running) return;
+        if (current_volume > 0) current_volume -= 10;
+        bsp_extra_codec_volume_set(current_volume, NULL);
+    }, LV_EVENT_CLICKED, NULL);
 }
 
 static void refresh_rom_list() {
@@ -336,19 +461,9 @@ static void refresh_rom_list() {
                 char *full_path = (char*)malloc(path_len);
                 snprintf(full_path, path_len, "/sdcard/GB/%s", ent->d_name);
                 
-                // MÁGICA: Lê o cabeçalho do arquivo para pegar o nome real!
-                char game_title[17] = {0};
-                FILE* f = fopen(full_path, "rb");
-                if (f) {
-                    fseek(f, 0x0134, SEEK_SET);
-                    fread(game_title, 1, 16, f);
-                    fclose(f);
-                }
-                if (strlen(game_title) == 0) strcpy(game_title, ent->d_name); // Fallback
-
-                lv_obj_t *btn = lv_list_add_button(list_roms, LV_SYMBOL_PLAY, game_title);
+                // Usa diretamente o nome do arquivo (ent->d_name)
+                lv_obj_t *btn = lv_list_add_button(list_roms, LV_SYMBOL_PLAY, ent->d_name);
                 
-                // Estilo da Lista LVGL v9
                 lv_obj_set_style_bg_color(btn, lv_color_hex(0x111111), 0);
                 lv_obj_set_style_text_color(btn, lv_color_white(), 0);
                 lv_obj_set_style_border_width(btn, 0, 0);
