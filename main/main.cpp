@@ -15,6 +15,11 @@
 #include "display/lv_display_private.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "driver/i2c_master.h"
+
+// Globais da Bateria
+static lv_obj_t *icon_batt_warning = NULL;
+static bool has_low_batt_saved = false;
 
 #define BOOT_BTN_PIN GPIO_NUM_0
 
@@ -97,6 +102,26 @@ static void clear_i2c_bus(void) {
 
     gpio_reset_pin(GPIO_NUM_14);
     gpio_reset_pin(GPIO_NUM_15);
+}
+
+static uint8_t read_battery_percentage(void) {
+    i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
+    if (!i2c_bus) return 100; // Retorna 100% caso o barramento não esteja pronto
+    
+    i2c_device_config_t pmu_cfg = {};
+    pmu_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    pmu_cfg.device_address = 0x34; // Endereço do AXP2101
+    pmu_cfg.scl_speed_hz = 400000;
+    
+    i2c_master_dev_handle_t pmu_handle;
+    uint8_t batt_percent = 100;
+    
+    if (i2c_master_bus_add_device(i2c_bus, &pmu_cfg, &pmu_handle) == ESP_OK) {
+        uint8_t reg_addr = 0xA4;
+        i2c_master_transmit_receive(pmu_handle, &reg_addr, 1, &batt_percent, 1, 1000);
+        i2c_master_bus_rm_device(pmu_handle);
+    }
+    return (batt_percent > 100) ? 100 : batt_percent;
 }
 
 // ==========================================
@@ -195,6 +220,55 @@ static void emulator_task(void* arg) {
             ESP_LOGI(TAG, "FPS: %lu Lógico / %lu Visual", frames_logic, frames_draw);
             frames_logic = frames_draw = 0;
             last_fps_tick = now;
+
+            // --- NOVO: MONITORAMENTO DE BATERIA (A cada 30 segundos) ---
+            static uint8_t sec_counter = 30; // Começa em 30 para verificar imediatamente no boot do jogo
+            sec_counter++;
+
+            if (sec_counter >= 30) {
+                sec_counter = 0; // Reseta o contador
+                uint8_t current_battery_pct = read_battery_percentage();
+
+                // current_battery_pct = 25;
+
+                if (current_battery_pct <= 30) {
+                    
+                    // 1. Gatilho de Auto-Save (Executa ANTES de mudar a interface)
+                    if (current_battery_pct <= 10 && !has_low_batt_saved) {
+                        ESP_LOGW(TAG, "Nível crítico (10%%)! Salvando SRAM automaticamente...");
+                        if (gnuboy_sram_dirty()) {
+                            char sav_path[256];
+                            snprintf(sav_path, sizeof(sav_path), "%s", current_rom_path);
+                            char *ext = strrchr(sav_path, '.');
+                            if (ext) strcpy(ext, ".sav");
+                            gnuboy_save_sram(sav_path, false);
+                        }
+                        has_low_batt_saved = true;
+                    }
+
+                    // 2. Atualiza a Interface Gráfica de uma vez só com o estado final
+                    if (lvgl_port_lock(0)) {
+                        lv_obj_remove_flag(icon_batt_warning, LV_OBJ_FLAG_HIDDEN);
+                        
+                        if (current_battery_pct <= 10) {
+                            lv_obj_set_style_text_color(icon_batt_warning, lv_color_hex(0xFF3333), 0); // Vermelho
+                            lv_label_set_text(icon_batt_warning, LV_SYMBOL_BATTERY_EMPTY " 10% - Jogo Salvo!");
+                        } else {
+                            lv_obj_set_style_text_color(icon_batt_warning, lv_color_hex(0xFFD700), 0); // Amarelo
+                            lv_label_set_text(icon_batt_warning, LV_SYMBOL_BATTERY_EMPTY " Bateria Fraca!");
+                        }
+                        lvgl_port_unlock();
+                    }
+
+                } else {
+                    // Bateria segura: Esconde o ícone
+                    if (lvgl_port_lock(0)) {
+                        lv_obj_add_flag(icon_batt_warning, LV_OBJ_FLAG_HIDDEN);
+                        lvgl_port_unlock();
+                    }
+                }
+            }
+            // --------------------------------------
         }
 
         // --- 5. MARCAPASSO DOS 60 FPS (16.74ms do Gameboy) ---
@@ -294,6 +368,8 @@ static void start_game(const char* path) {
     // ---------------------------------------------
     
     emu_running = true; 
+
+    has_low_batt_saved = false;
     
     // Inicia as tasks usando os níveis do Factory Firmware
     if (audio_enabled) { 
@@ -383,11 +459,11 @@ static void build_ui() {
     lv_label_set_text(title, "Game Boy Color");
     lv_obj_set_style_text_color(title, lv_color_white(), 0); 
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 20);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 50, 20);
 
     // --- NOVO: BOTÃO (SWITCH) DE ÁUDIO NO MENU ---
     lv_obj_t * sw_audio = lv_switch_create(scr_menu);
-    lv_obj_align(sw_audio, LV_ALIGN_TOP_RIGHT, -20, 20);
+    lv_obj_align(sw_audio, LV_ALIGN_TOP_RIGHT, -50, 20);
     if(audio_enabled) lv_obj_add_state(sw_audio, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw_audio, [](lv_event_t *e) {
         lv_obj_t * sw = (lv_obj_t *)lv_event_get_target(e);
@@ -411,11 +487,17 @@ static void build_ui() {
     lv_obj_set_style_bg_color(scr_play, lv_color_black(), 0);
     lv_obj_remove_flag(scr_play, LV_OBJ_FLAG_SCROLLABLE);
 
-    // --- TODOS OS BOTÕES MANTIDOS NAS CORES E OPACIDADE ORIGINAIS ---
+    // Ícone de Aviso de Bateria (Oculto por Padrão)
+    icon_batt_warning = lv_label_create(scr_play);
+    lv_label_set_text(icon_batt_warning, LV_SYMBOL_BATTERY_EMPTY " Bateria Fraca!");
+    lv_obj_set_style_text_color(icon_batt_warning, lv_color_hex(0xFFD700), 0); // Amarelo
+    lv_obj_align(icon_batt_warning, LV_ALIGN_TOP_MID, 0, 0); // Fica no topo, no meio
+    lv_obj_add_flag(icon_batt_warning, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_t *btn_exit = lv_label_create(scr_play);
     lv_label_set_text(btn_exit, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_color(btn_exit, lv_color_hex(0xFF3333), 0);
-    lv_obj_set_style_text_font(btn_exit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(btn_exit, lv_color_hex(0xEE2222), 0);
+    lv_obj_set_style_text_font(btn_exit, &lv_font_montserrat_14, 0);
     lv_obj_align(btn_exit, LV_ALIGN_TOP_LEFT, 90, 0);
     lv_obj_add_flag(btn_exit, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(btn_exit, 20); 
@@ -444,6 +526,8 @@ static void build_ui() {
     lv_obj_set_style_border_width(btn_a, 0, 0);
     lv_obj_t * lbl_a = lv_label_create(btn_a);
     lv_label_set_text(lbl_a, "A");
+    lv_obj_set_style_text_color(lbl_a, lv_color_black(), 0);
+    lv_obj_set_style_text_font(lbl_a, &lv_font_montserrat_30, 0);
     lv_obj_center(lbl_a);
 
     lv_obj_t * btn_b = lv_obj_create(scr_play);
@@ -455,11 +539,13 @@ static void build_ui() {
     lv_obj_set_style_border_width(btn_b, 0, 0);
     lv_obj_t * lbl_b = lv_label_create(btn_b);
     lv_label_set_text(lbl_b, "B");
+    lv_obj_set_style_text_color(lbl_b, lv_color_black(), 0);
+    lv_obj_set_style_text_font(lbl_b, &lv_font_montserrat_30, 0);
     lv_obj_center(lbl_b);
 
     lv_obj_t * btn_start = lv_obj_create(scr_play);
     lv_obj_set_size(btn_start, 40, 30); 
-    lv_obj_align(btn_start, LV_ALIGN_LEFT_MID, 10, -110); 
+    lv_obj_align(btn_start, LV_ALIGN_LEFT_MID, 5, -130); 
     lv_obj_set_style_radius(btn_start, 10, 0);
     lv_obj_set_style_bg_color(btn_start, lv_color_hex(0x222222), 0);
     lv_obj_set_style_bg_opa(btn_start, LV_OPA_70, 0);
@@ -471,7 +557,7 @@ static void build_ui() {
 
     lv_obj_t * btn_select = lv_obj_create(scr_play);
     lv_obj_set_size(btn_select, 40, 30); 
-    lv_obj_align(btn_select, LV_ALIGN_LEFT_MID, 10, -50); 
+    lv_obj_align(btn_select, LV_ALIGN_LEFT_MID, 5, -30); 
     lv_obj_set_style_radius(btn_select, 10, 0);
     lv_obj_set_style_bg_color(btn_select, lv_color_hex(0x222222), 0);
     lv_obj_set_style_bg_opa(btn_select, LV_OPA_70, 0);
@@ -484,10 +570,11 @@ static void build_ui() {
     lv_obj_t * btn_vol_up = lv_btn_create(scr_play);
     lv_obj_set_size(btn_vol_up, 35, 35);
     lv_obj_align(btn_vol_up, LV_ALIGN_TOP_RIGHT, -10, 60);
-    lv_obj_set_style_bg_color(btn_vol_up, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(btn_vol_up, lv_color_hex(0x222222), 0);
     lv_obj_set_style_bg_opa(btn_vol_up, LV_OPA_70, 0);
     lv_obj_t * lbl_vup = lv_label_create(btn_vol_up);
     lv_label_set_text(lbl_vup, LV_SYMBOL_VOLUME_MAX);
+    lv_obj_set_style_text_color(lbl_vup, lv_color_hex(0x666666), 0);
     lv_obj_center(lbl_vup);
     lv_obj_add_event_cb(btn_vol_up, [](lv_event_t *e) {
         if(!emu_running) return;
@@ -498,10 +585,11 @@ static void build_ui() {
     lv_obj_t * btn_vol_down = lv_btn_create(scr_play);
     lv_obj_set_size(btn_vol_down, 35, 35);
     lv_obj_align(btn_vol_down, LV_ALIGN_TOP_RIGHT, -10, 110);
-    lv_obj_set_style_bg_color(btn_vol_down, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(btn_vol_down, lv_color_hex(0x222222), 0);
     lv_obj_set_style_bg_opa(btn_vol_down, LV_OPA_70, 0);
     lv_obj_t * lbl_vdown = lv_label_create(btn_vol_down);
     lv_label_set_text(lbl_vdown, LV_SYMBOL_VOLUME_MID);
+    lv_obj_set_style_text_color(lbl_vdown, lv_color_hex(0x666666), 0);
     lv_obj_center(lbl_vdown);
     lv_obj_add_event_cb(btn_vol_down, [](lv_event_t *e) {
         if(!emu_running) return;
