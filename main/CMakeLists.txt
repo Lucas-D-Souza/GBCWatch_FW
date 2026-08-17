@@ -9,6 +9,8 @@ idf_component_register(
         "."
         "gnuboy"
     REQUIRES 
+        "app_update"
+        "esp_partition"
         "bsp_board_extra"
         "ui_common"
         "esp_lcd"

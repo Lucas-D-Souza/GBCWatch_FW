@@ -13,6 +13,10 @@
 #include <dirent.h>
 #include <string.h>
 #include "display/lv_display_private.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+
+#define BOOT_BTN_PIN GPIO_NUM_0
 
 // Variáveis Globais de Áudio
 static bool audio_enabled = true; 
@@ -51,8 +55,11 @@ static lv_obj_t *scr_play = NULL;
 static lv_obj_t *list_roms = NULL;
 
 // Variáveis de Áudio
-static int current_volume = 80;
+static int current_volume = 50;
 static TaskHandle_t audio_task_handle = NULL;
+
+// Variável para guardar o caminho do jogo e criar o .sav
+static char current_rom_path[256] = "";
 
 // ==========================================
 // FUNÇÕES DE HARDWARE E LVGL
@@ -196,16 +203,26 @@ static void emulator_task(void* arg) {
         
         if (current_time_us < next_frame_target_us) {
             uint32_t delay_us = next_frame_target_us - current_time_us;
-            if (delay_us > 2000) {
+            if (delay_us > 1000) {
+                // Emulador está rápido: Devolve a sobra de tempo pro FreeRTOS (Alimenta Watchdog)
                 vTaskDelay(pdMS_TO_TICKS(delay_us / 1000));
             } else {
                 taskYIELD();
             }
         } else {
+            // Emulador está Atrasado/Pesado!
+            // APLICAÇÃO DA SUA CORREÇÃO: Força a CPU1 a respirar a cada 10 frames lógicos
+            // Isso impede que o CPU1 monopolize o Ringbuffer e cause o Timeout no CPU0
+            if (frames_logic % 10 == 0) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            } else {
+                taskYIELD(); 
+            }
+
+            // Impede que a meta de tempo fique inalcançável (evita a espiral da morte)
             if (current_time_us - next_frame_target_us > 33484) {
                 next_frame_target_us = current_time_us; 
             }
-            taskYIELD(); 
         }
     }
     emu_task_handle = NULL;
@@ -217,6 +234,8 @@ static void emulator_task(void* arg) {
 // ==========================================
 static void start_game(const char* path) {
     if (emu_running) return;
+
+    strncpy(current_rom_path, path, sizeof(current_rom_path));
 
     // Aloca os buffers de vídeo na SRAM interna
     if (!dma_buffer[0]) dma_buffer[0] = (uint16_t*)heap_caps_malloc(320 * SCALED_CHUNK_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
@@ -263,6 +282,16 @@ static void start_game(const char* path) {
     gnuboy_set_framebuffer(gnuboy_fb);
     gnuboy_load_rom(emu_rom_buffer, rom_size);
     gnuboy_reset(true);
+
+    // --- NOVO: LÓGICA DE CARREGAMENTO DO .SAV ---
+    char sav_path[256];
+    snprintf(sav_path, sizeof(sav_path), "%s", current_rom_path);
+    char *ext = strrchr(sav_path, '.');
+    if (ext) strcpy(ext, ".sav"); // Troca .gb/.gbc por .sav
+
+    gnuboy_load_sram(sav_path); // O Gnuboy trata silenciosamente se o arquivo não existir
+    ESP_LOGI(TAG, "Save Game carregado (se existente): %s", sav_path);
+    // ---------------------------------------------
     
     emu_running = true; 
     
@@ -298,6 +327,19 @@ static void stop_game() {
             vRingbufferDelete(audio_ringbuf); 
             audio_ringbuf = NULL; 
         }
+    }
+
+    // Lógica gravação do .sav
+    if (gnuboy_sram_dirty()) {
+        char sav_path[256];
+        snprintf(sav_path, sizeof(sav_path), "%s", current_rom_path);
+        char *ext = strrchr(sav_path, '.');
+        if (ext) strcpy(ext, ".sav");
+        
+        gnuboy_save_sram(sav_path, false);
+        ESP_LOGI(TAG, "Progresso salvo com sucesso em: %s", sav_path);
+    } else {
+        ESP_LOGI(TAG, "Nenhuma alteracao na SRAM. Save ignorado.");
     }
 
     // 5. Libera a memória da ROM e dos Buffers de Vídeo
@@ -501,6 +543,14 @@ static void refresh_rom_list() {
 extern "C" void app_main(void) {
     clear_i2c_bus();
 
+    // Configuração do Botão BOOT
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << BOOT_BTN_PIN);
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -525,7 +575,36 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "GBC_OS Pronto a 240MHz!");
     
+    // Loop principal da aplicação atuando como vigilante do botão BOOT
     while(1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // Verifica se o botão foi pressionado (Nível Lógico Baixo)
+        if (gpio_get_level(BOOT_BTN_PIN) == 0) {
+            ESP_LOGI(TAG, "Botão BOOT pressionado! Retornando ao Factory Firmware...");
+
+            // 1. Se o jogo estiver rodando, desliga graciosamente (Garante o Save do .sav!)
+            if (emu_running) {
+                stop_game();
+            }
+
+            // 2. Apaga a tela para dar feedback visual imediato ao usuário
+            bsp_display_brightness_set(0); 
+
+            // 3. Localiza a partição de fábrica original
+            const esp_partition_t *factory_part = esp_partition_find_first(
+                ESP_PARTITION_TYPE_APP, 
+                ESP_PARTITION_SUBTYPE_APP_FACTORY, 
+                NULL
+            );
+            
+            // 4. Altera o ponteiro do Bootloader e reinicia
+            if (factory_part) {
+                esp_ota_set_boot_partition(factory_part);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            }
+        }
+        
+        // Verifica a cada 100ms para manter a responsividade sem gastar CPU
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
