@@ -1,0 +1,8 @@
+dependencies:
+  waveshare/esp32_s3_touch_amoled_2_06: '*'
+  lvgl/lvgl: '>=9.4.0'
+  chmorgan/esp-audio-player: 1.0.*
+  chmorgan/esp-file-iterator: 1.0.0
+  espressif/esp_codec_dev: 1.5.*
+  espressif/esp_tinyusb: 1.4.5
+  espressif/esp_jpeg: '*'

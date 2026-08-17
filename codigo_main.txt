@@ -1,0 +1,1408 @@
+﻿
+=== ARQUIVO: main/ ===
+
+idf_component_register(
+    SRCS "main.cpp"
+         "SdUsbManager.cpp"
+    INCLUDE_DIRS "."
+    REQUIRES 
+        "esp32_s3_touch_amoled_2_06"
+        "bsp_board_extra"
+        "lvgl"
+        "nvs_flash"
+        "esp_wifi"
+        "esp_event"
+        "esp_netif"
+        "lwip"
+        "app_netinfo"
+        "app_sysinfo"
+        "ui_common"
+        "app_nettools"
+        "fatfs"
+        "esp_tinyusb"
+        "app_file_explorer"
+        "app_gbc_emulator"
+)
+
+=== ARQUIVO: main/ ===
+
+dependencies:
+  waveshare/esp32_s3_touch_amoled_2_06: "*"
+  lvgl/lvgl: ">=9.4.0"
+  chmorgan/esp-audio-player: "1.0.*"
+  chmorgan/esp-file-iterator: "1.0.0"
+  espressif/esp_codec_dev: "1.5.*"
+  espressif/esp_tinyusb: "1.4.5"
+
+=== ARQUIVO: main/ ===
+
+#include "esp_log.h"
+#include "bsp/esp-bsp.h"
+#include "lvgl.h"
+#include "driver/i2c_master.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "driver/gpio.h"
+#include <string.h>
+#include "esp_netif.h"
+#include "app_netinfo.h"
+#include "app_sysinfo.h"
+#include "esp_sleep.h"
+#include "ui_common.h"
+#include "app_nettools.h"
+#include "SdUsbManager.hpp"
+#include "app_file_explorer.h"
+#include "app_gbc_emulator.h"
+// Bibliotecas de Tempo e NTP
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
+
+static const char *TAG = "Relogio";
+
+#define BOOT_BTN_PIN GPIO_NUM_0
+#define AXP2101_ADDR 0x34
+
+TaskHandle_t lvgl_task_handle = NULL;
+
+static i2c_master_dev_handle_t rtc_handle = NULL;
+static i2c_master_bus_handle_t i2c_bus = NULL;
+
+// Telas
+static lv_obj_t *scr_watchface;
+static lv_obj_t *scr_settings;
+lv_obj_t *scr_apps;
+static lv_obj_t *scr_wifi_list;
+static lv_obj_t *scr_password;
+static lv_obj_t *scr_usb_msc;
+
+// Componentes Globais
+static lv_obj_t *time_label;
+static lv_obj_t *date_label;
+static lv_obj_t *icon_wifi_watchface;
+static lv_obj_t *icon_wifi_slash;
+static lv_obj_t *icon_charge_watchface;
+static uint8_t current_battery_pct = 100;
+static lv_obj_t *list_wifi;
+static lv_obj_t *btn_wifi_settings; 
+static lv_obj_t *sw_wifi_list;
+static lv_obj_t *label_battery_watchface;
+static lv_obj_t *btn_usb_settings; 
+
+// Componentes da Tela de Senha
+static lv_obj_t *ta_password;         
+static lv_obj_t *label_password_title;
+static lv_obj_t *kb_password;
+static lv_obj_t *slider_brightness;        
+
+// Estados do Sistema
+static bool wifi_started = false;
+static bool usb_msc_started = false;
+static char current_ssid[33] = {0};
+static char current_password[65] = {0};
+
+// VariÃ¡veis para gerenciamento de energia
+static uint32_t last_activity_time = 0;
+static bool is_dimmed = false;
+
+uint8_t dec2bcd(uint8_t val) { return ((val / 10) << 4) + (val % 10); }
+uint8_t bcd2dec(uint8_t val) { return ((val >> 4) * 10) + (val & 0x0F); }
+
+static void start_wifi_scan(void);
+static void wifi_list_item_click_cb(lv_event_t * e);
+static void password_gesture_cb(lv_event_t * e);
+
+static void time_sync_notification_cb(struct timeval *tv) {
+    ESP_LOGI(TAG, "SNTP Sincronizado com a internet! Gravando no RTC...");
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    if (rtc_handle) {
+        uint8_t data[8];
+        data[0] = 0x04; 
+        data[1] = dec2bcd(timeinfo.tm_sec);
+        data[2] = dec2bcd(timeinfo.tm_min);
+        data[3] = dec2bcd(timeinfo.tm_hour);
+        data[4] = dec2bcd(timeinfo.tm_mday);
+        data[5] = dec2bcd(timeinfo.tm_wday);
+        data[6] = dec2bcd(timeinfo.tm_mon + 1);    
+        data[7] = dec2bcd(timeinfo.tm_year % 100); 
+        
+        i2c_master_transmit(rtc_handle, data, 8, 1000);
+        ESP_LOGI(TAG, "RTC atualizado com sucesso: %02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+}
+
+static void initialize_sntp(void) {
+    ESP_LOGI(TAG, "Iniciando servico NTP...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+    
+    setenv("TZ", "<-03>3", 1);
+    tzset();
+}
+
+// void style_list_item(lv_obj_t * item) {
+//     if (item == NULL) return;
+//     lv_obj_set_style_bg_color(item, lv_color_black(), 0);
+//     lv_obj_set_style_bg_opa(item, LV_OPA_COVER, 0);
+//     lv_obj_set_style_text_color(item, lv_color_white(), 0);
+//     lv_obj_set_style_border_width(item, 0, 0); 
+//     lv_obj_set_style_text_font(item, &lv_font_montserrat_20, 0); 
+//     lv_obj_set_style_pad_ver(item, 18, 0);  
+//     lv_obj_set_style_pad_column(item, 12, 0); 
+// }
+
+static void set_wifi_state(bool state) {
+    wifi_started = state;
+    if (state) {
+        ESP_LOGI(TAG, "Wi-Fi: Ligando antena...");
+        esp_wifi_start();
+        if (btn_wifi_settings) lv_obj_set_style_bg_color(btn_wifi_settings, lv_color_hex(0x007BFF), 0);
+        if (sw_wifi_list) lv_obj_add_state(sw_wifi_list, LV_STATE_CHECKED);
+        if (icon_wifi_watchface) lv_obj_set_style_text_color(icon_wifi_watchface, lv_color_white(), 0); 
+        if (icon_wifi_slash) lv_obj_add_flag(icon_wifi_slash, LV_OBJ_FLAG_HIDDEN); // Esconde a barra
+    } else {
+        ESP_LOGI(TAG, "Wi-Fi: Desligando antena...");
+        esp_wifi_stop();
+        if (btn_wifi_settings) lv_obj_set_style_bg_color(btn_wifi_settings, lv_color_hex(0x333333), 0);
+        if (sw_wifi_list) lv_obj_remove_state(sw_wifi_list, LV_STATE_CHECKED);
+        if (icon_wifi_watchface) lv_obj_set_style_text_color(icon_wifi_watchface, lv_color_hex(0x333333), 0); 
+        if (icon_wifi_slash) lv_obj_remove_flag(icon_wifi_slash, LV_OBJ_FLAG_HIDDEN); // Mostra a barra
+    }
+}
+
+// Timer para dar tempo da tela renderizar antes do gargalo de hardware
+static void delayed_usb_start_cb(lv_timer_t * t) {
+    // Passa o controle para o PC apenas agora
+    SdUsbManager::get_instance().enable_usb_msc();
+    lv_timer_delete(t); // Timer de disparo Ãºnico
+}
+
+// FunÃ§Ã£o para alternar o modo Pendrive
+static void set_usb_msc_state(bool state) {
+    if (state == usb_msc_started) return; // Evita loop de estado
+
+    usb_msc_started = state;
+    
+    if (state) {
+        ESP_LOGI(TAG, "USB MSC: Solicitando ativaÃ§Ã£o com delay visual...");
+        if (btn_usb_settings) lv_obj_set_style_bg_color(btn_usb_settings, lv_color_hex(0x007BFF), 0);
+        
+        // Vai para a tela estÃ¡tica SEM animaÃ§Ã£o para evitar processamento grÃ¡fico (DMA) simultÃ¢neo ao USB
+        lv_scr_load_anim(scr_usb_msc, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+        
+        // DÃ¡ 300ms para o LVGL limpar o buffer e desenhar a tela antes do USB assumir a CPU
+        lv_timer_create(delayed_usb_start_cb, 300, NULL);
+    } else {
+        ESP_LOGI(TAG, "USB MSC: Desligando Modo Pendrive...");
+        
+        // Retoma o controle para o RelÃ³gio (Vai causar o Restart para recuperar o Serial)
+        SdUsbManager::get_instance().disable_usb_msc();
+    }
+}
+
+static void home_btn_timer_cb(lv_timer_t *timer) {
+    static uint8_t last_state = 1;
+    uint8_t current_state = gpio_get_level(BOOT_BTN_PIN);
+    
+    // 1. VerificaÃ§Ã£o do BotÃ£o FÃ­sico
+    if (last_state == 1 && current_state == 0) { 
+        if (lv_screen_active() != scr_watchface) {
+            lv_scr_load_anim(scr_watchface, LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, false);
+        }
+        // Acorda a tela caso o usuÃ¡rio aperte o botÃ£o no escuro
+        reset_inactivity_timer(); 
+    }
+    last_state = current_state;
+
+    // 2. [NOVO] VerificaÃ§Ã£o Global de Toque na Tela
+    // Pega o ponteiro do driver de touch ativo no LVGL
+    lv_indev_t * indev = lv_indev_get_next(NULL); 
+    if (indev) {
+        // Se a tela estiver sendo tocada em QUALQUER lugar, reseta o timer
+        if (lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
+            reset_inactivity_timer();
+        }
+    }
+}
+
+static void update_time_timer_cb(lv_timer_t *timer) {
+    if (!rtc_handle) return;
+    uint8_t reg_addr = 0x04; 
+    uint8_t data[7] = {0};   
+    if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+        if (i2c_master_transmit_receive(rtc_handle, &reg_addr, 1, data, 7, 1000) == ESP_OK) {
+            uint8_t sec = bcd2dec(data[0] & 0x7F);
+            uint8_t min = bcd2dec(data[1] & 0x7F);
+            uint8_t hour = bcd2dec(data[2] & 0x3F);
+            uint8_t day = bcd2dec(data[3] & 0x3F);
+            uint8_t month = bcd2dec(data[5] & 0x1F);
+            uint16_t year = 2000 + bcd2dec(data[6]);
+            if (time_label) lv_label_set_text_fmt(time_label, "%02d:%02d:%02d", hour, min, sec);
+            if (date_label) lv_label_set_text_fmt(date_label, "%02d/%02d/%04d", day, month, year);
+        }
+        bsp_display_unlock();
+    }
+}
+
+static void align_pixels_cb(lv_event_t * e) {
+    lv_area_t * area = (lv_area_t *)lv_event_get_param(e);
+    area->x1 &= ~1; area->y1 &= ~1; area->x2 |= 1; area->y2 |= 1;
+}
+
+static void keyboard_ready_cb(lv_event_t * e) {
+    const char * pass = lv_textarea_get_text(ta_password);
+    strncpy(current_password, pass, sizeof(current_password) - 1);
+    
+    ESP_LOGI(TAG, "Tentando conectar a %s...", current_ssid);
+    lv_label_set_text(label_password_title, "Conectando...");
+    
+    wifi_config_t wifi_config = {};
+    strncpy((char *)wifi_config.sta.ssid, current_ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, current_password, sizeof(wifi_config.sta.password) - 1);
+    
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_connect();
+}
+
+static void keyboard_cancel_cb(lv_event_t * e) {
+    lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+}
+
+static void wifi_btn_short_click_cb(lv_event_t * e) {
+    set_wifi_state(!wifi_started); 
+}
+
+static void wifi_btn_long_cb(lv_event_t * e) {
+    lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+    if (wifi_started) start_wifi_scan();
+    else {
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            lv_obj_clean(list_wifi); 
+            lv_obj_t * txt = lv_list_add_text(list_wifi, "Wi-Fi Desligado");
+            style_list_item(txt);
+            bsp_display_unlock();
+        }
+    }
+}
+
+// Timer de atraso para dar tempo do rÃ¡dio RF ligar antes de escanear
+static void delayed_wifi_scan_cb(lv_timer_t * t) {
+    start_wifi_scan();
+    lv_timer_delete(t); // Timer de disparo Ãºnico, se destrÃ³i apÃ³s o uso
+}
+
+static void wifi_list_switch_cb(lv_event_t * e) {
+    lv_obj_t * sw = (lv_obj_t *)lv_event_get_target(e);
+    bool is_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    set_wifi_state(is_on); 
+    if (is_on) {
+        // Aguarda 500ms para a antena do ESP32 estabilizar antes da varredura
+        lv_timer_create(delayed_wifi_scan_cb, 500, NULL);
+    } else {
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            lv_obj_clean(list_wifi); 
+            lv_obj_t * txt = lv_list_add_text(list_wifi, "Wi-Fi Desligado");
+            style_list_item(txt);
+            bsp_display_unlock();
+        }
+    }
+}
+
+static void wifi_list_item_click_cb(lv_event_t * e) {
+    lv_obj_t * btn = (lv_obj_t *)lv_event_get_target(e);
+    lv_obj_t * label = lv_obj_get_child(btn, 1); 
+    if (label) {
+        const char * text = lv_label_get_text(label);
+        const char * paren = strrchr(text, '(');
+        if (paren != NULL && paren > text) {
+            int len = paren - text - 1; 
+            if (len > 32) len = 32;
+            strncpy(current_ssid, text, len);
+            current_ssid[len] = '\0';
+        } else {
+            strncpy(current_ssid, text, 32);
+            current_ssid[32] = '\0';
+        }
+
+        ESP_LOGI(TAG, "Rede selecionada: %s", current_ssid);
+        
+        // Verifica se a rede jÃ¡ estÃ¡ salva no NVS
+        wifi_config_t saved_config;
+        esp_wifi_get_config(WIFI_IF_STA, &saved_config);
+
+        char title_buf[64];
+        if (strcmp((char*)saved_config.sta.ssid, current_ssid) == 0 && strlen((char*)saved_config.sta.password) > 0) {
+            ESP_LOGI(TAG, "Rede ja salva. Preenchendo teclado e auto-conectando.");
+            snprintf(title_buf, sizeof(title_buf), "Conectando: %s", current_ssid);
+            lv_label_set_text(label_password_title, title_buf);
+            
+            // Preenche o teclado com a senha antiga (Ãºtil se a pessoa sÃ³ quiser ver ou editar)
+            lv_textarea_set_text(ta_password, (char*)saved_config.sta.password);
+            
+            // Tenta conectar logo de cara
+            esp_wifi_connect();
+        } else {
+            snprintf(title_buf, sizeof(title_buf), "Senha: %s", current_ssid);
+            lv_label_set_text(label_password_title, title_buf);
+            lv_textarea_set_text(ta_password, ""); 
+        }
+
+        lv_scr_load_anim(scr_password, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+    }
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) 
+{
+    // [NOVO] Auto-conectar ao ligar a antena
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "Wi-Fi Iniciado. Tentando auto-conectar na rede salva...");
+        esp_wifi_connect();
+    }
+    
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+        
+        if (ap_count == 0) {
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                lv_obj_clean(list_wifi); 
+                lv_obj_t * txt = lv_list_add_text(list_wifi, "Nenhuma rede encontrada");
+                style_list_item(txt);
+                bsp_display_unlock();
+            }
+            return;
+        }
+
+        if (ap_count > 15) ap_count = 15;
+        wifi_ap_record_t *ap_info = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count);
+        if (ap_info == NULL) return;
+
+        if (esp_wifi_scan_get_ap_records(&ap_count, ap_info) == ESP_OK) {
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                lv_obj_clean(list_wifi); 
+                for (int i = 0; i < ap_count; i++) {
+                    char ssid_str[33];
+                    strncpy(ssid_str, (char *)ap_info[i].ssid, 32);
+                    ssid_str[32] = '\0'; // <-- CORREÃ‡ÃƒO AQUI
+                    if (strlen(ssid_str) == 0) continue;
+
+                    char list_item_text[64];
+                    snprintf(list_item_text, sizeof(list_item_text), "%s (%d dBm)", ssid_str, ap_info[i].rssi);
+
+                    lv_obj_t * btn = lv_list_add_button(list_wifi, LV_SYMBOL_WIFI, list_item_text);
+                    style_list_item(btn); 
+                    lv_obj_add_event_cb(btn, wifi_list_item_click_cb, LV_EVENT_CLICKED, NULL);
+                }
+                bsp_display_unlock();
+            }
+        }
+        free(ap_info);
+    }
+    
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Desconectado do Wi-Fi.");
+        
+        if (wifi_started && icon_wifi_watchface) {
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                lv_obj_set_style_text_color(icon_wifi_watchface, lv_color_white(), 0);
+                bsp_display_unlock();
+            }
+        }
+
+        if (lv_screen_active() == scr_password) {
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                lv_label_set_text(label_password_title, "Falha! Senha Incorreta?");
+                bsp_display_unlock();
+            }
+        }
+    }
+    
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Conectado! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        // LÃª do chip de Wi-Fi o nome da rede que conectamos e salva na global
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            strncpy(current_ssid, (char *)ap_info.ssid, sizeof(current_ssid) - 1);
+            current_ssid[sizeof(current_ssid) - 1] = '\0';
+        }
+
+        if (icon_wifi_watchface) {
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                lv_obj_set_style_text_color(icon_wifi_watchface, lv_color_hex(0x00FF00), 0);
+                bsp_display_unlock();
+            }
+        }
+
+        static bool sntp_inited = false;
+        if (!sntp_inited) {
+            initialize_sntp();
+            sntp_inited = true;
+        }
+        
+        if (lv_screen_active() == scr_password) {
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                lv_label_set_text(label_password_title, "Conectado!");
+                lv_scr_load_anim(scr_settings, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 400, 1000, false);
+                bsp_display_unlock();
+            }
+        }
+    }
+}
+
+static void start_wifi_scan(void) {
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        lv_obj_clean(list_wifi); 
+        lv_obj_t * txt = lv_list_add_text(list_wifi, "Escaneando...");
+        style_list_item(txt);
+        bsp_display_unlock();
+    }
+    wifi_scan_config_t scan_config = {};
+    scan_config.show_hidden = false;
+    scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan_config.scan_time.active.min = 100;
+    scan_config.scan_time.active.max = 300;
+    esp_wifi_scan_start(&scan_config, false);
+}
+
+static void init_wifi_basic(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    esp_wifi_set_storage(WIFI_STORAGE_FLASH); 
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+}
+
+static void watchface_gesture_cb(lv_event_t * e) {
+    lv_indev_t * indev = lv_indev_active();
+    if(indev == NULL) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if(dir == LV_DIR_BOTTOM) lv_scr_load_anim(scr_settings, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 300, 0, false);
+    else if(dir == LV_DIR_LEFT) lv_scr_load_anim(scr_apps, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+}
+
+static void settings_gesture_cb(lv_event_t * e) {
+    lv_indev_t * indev = lv_indev_active();
+    if(indev == NULL) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if(dir == LV_DIR_TOP) lv_scr_load_anim(scr_watchface, LV_SCR_LOAD_ANIM_MOVE_TOP, 300, 0, false);
+    else if(dir == LV_DIR_RIGHT && touch_start_x < 20) lv_scr_load_anim(scr_watchface, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+}
+
+static void apps_gesture_cb(lv_event_t * e) {
+    lv_indev_t * indev = lv_indev_active();
+    if(indev != NULL && lv_indev_get_gesture_dir(indev) == LV_DIR_RIGHT) {
+        lv_scr_load_anim(scr_watchface, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+    }
+}
+
+static void wifi_list_gesture_cb(lv_event_t * e) {
+    lv_indev_t * indev = lv_indev_active();
+    if(indev == NULL) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if(dir == LV_DIR_RIGHT && touch_start_x < 20) {
+        lv_scr_load_anim(scr_settings, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+    }
+}
+
+static void password_gesture_cb(lv_event_t * e) {
+    lv_indev_t * indev = lv_indev_active();
+    if(indev == NULL) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if(dir == LV_DIR_RIGHT && touch_start_x < 20) {
+        lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+    }
+}
+
+// ---------------------------------------------------------
+// EVENTOS DE BRILHO E APLICATIVOS
+// ---------------------------------------------------------
+static void brightness_slider_cb(lv_event_t * e) {
+    lv_obj_t * slider = (lv_obj_t *)lv_event_get_target(e);
+    int32_t value = lv_slider_get_value(slider);
+    bsp_display_brightness_set(value);
+}
+
+// Evento ao clicar no Ã­cone do App de Rede
+static void app_netinfo_click_cb(lv_event_t * e) {
+    // Atualiza as informaÃ§Ãµes passando os dados da main
+    app_netinfo_update(wifi_started, current_ssid);
+    
+    // ObtÃ©m a tela do componente e carrega na tela com animaÃ§Ã£o
+    lv_obj_t * target_screen = app_netinfo_get_screen();
+    if(target_screen) {
+        lv_scr_load_anim(target_screen, LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, false);
+    }
+}
+
+// ---------------------------------------------------------
+// COMPORTAMENTO DE ENERGIA E BATERIA (AXP2101 via I2C)
+// ---------------------------------------------------------
+
+static uint8_t read_battery_percentage(void) {
+    // Apenas use o i2c_bus global que inicializamos na app_main
+    if (!i2c_bus) return 0;
+    
+    i2c_device_config_t pmu_cfg = {};
+    pmu_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    pmu_cfg.device_address = AXP2101_ADDR;
+    pmu_cfg.scl_speed_hz = 400000;
+    
+    i2c_master_dev_handle_t pmu_handle;
+    if (i2c_master_bus_add_device(i2c_bus, &pmu_cfg, &pmu_handle) == ESP_OK) {
+        uint8_t reg_addr = 0xA4;
+        uint8_t batt_percent = 0;
+        i2c_master_transmit_receive(pmu_handle, &reg_addr, 1, &batt_percent, 1, 1000);
+        i2c_master_bus_rm_device(pmu_handle);
+        return (batt_percent > 100) ? 100 : batt_percent;
+    }
+    return 0;
+}
+
+// Reseta o contador sempre que houver toque ou gesto nas telas
+void reset_inactivity_timer(void) {
+    last_activity_time = lv_tick_get();
+    if (is_dimmed) {
+        bsp_display_brightness_set(80); // Restaura o brilho padrao (80%)
+        is_dimmed = false;
+        ESP_LOGI(TAG, "Atividade detectada! Brilho restaurado.");
+    }
+}
+
+// Deve ser associada as telas para monitorar interacoes fisicas
+static void global_touch_intercept_cb(lv_event_t * e) {
+    reset_inactivity_timer();
+}
+
+static void check_power_management_timer_cb(lv_timer_t * timer) {
+    uint32_t elapsed = lv_tick_elaps(last_activity_time);
+    
+    // ObtÃ©m a tela atualmente ativa
+    lv_obj_t * current_screen = lv_screen_active();
+    
+    // Define se estamos no "modo principal" ou no "modo pendrive"
+    bool is_usb_screen = (current_screen == scr_usb_msc);
+    bool is_main_interface = (current_screen == scr_watchface || 
+                              current_screen == scr_settings || 
+                              current_screen == scr_apps ||
+                              current_screen == scr_wifi_list ||
+                              current_screen == scr_password);
+
+    // LÃ³gica do Brilho
+    uint32_t dim_threshold = 10000; // PadrÃ£o 10s para Watchface/Main/USB
+    if (!is_main_interface && !is_usb_screen) {
+        dim_threshold = 30000; // Para Apps (Menu), 30s
+    }
+
+    // LÃ³gica de Desligamento Profundo (Deep Sleep)
+    uint32_t off_threshold = 180000; // PadrÃ£o 3 minutos para todas as telas (180000ms)
+    if (is_usb_screen) {
+        // Se estiver no Pendrive, segura o relÃ³gio ligado por 4 horas (4 * 60 * 60 * 1000 = 14400000ms)
+        off_threshold = 14400000; 
+    }
+
+    // LÃ³gica para diminuir o brilho
+    if (elapsed >= dim_threshold && !is_dimmed) {
+        bsp_display_brightness_set(10); // Reduz para 10%
+        is_dimmed = true;
+        ESP_LOGI(TAG, "Inatividade alcanÃ§ada. Esmaecendo tela...");
+    }
+
+    // LÃ³gica para desligar o relÃ³gio
+    if (elapsed >= off_threshold) {
+        ESP_LOGW(TAG, "Inatividade (Limite: %lum) alcanÃ§ada. Desligando sistema via AXP2101...", off_threshold / 60000);
+        bsp_display_backlight_off();
+        if (wifi_started) { esp_wifi_stop(); }
+        
+        if (i2c_bus) {
+            i2c_device_config_t pmu_cfg = {};
+            pmu_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+            pmu_cfg.device_address = 0x34; // AXP2101_ADDR
+            pmu_cfg.scl_speed_hz = 400000;
+            
+            i2c_master_dev_handle_t pmu_handle;
+            if (i2c_master_bus_add_device(i2c_bus, &pmu_cfg, &pmu_handle) == ESP_OK) {
+                uint8_t reg_addr = 0x10;
+                uint8_t val = 0;
+                
+                if (i2c_master_transmit_receive(pmu_handle, &reg_addr, 1, &val, 1, 1000) == ESP_OK) {
+                    val |= 0x01; 
+                    uint8_t data_write[2] = {0x10, val};
+                    
+                    ESP_LOGW(TAG, "Comando enviado! Cortando energia...");
+                    i2c_master_transmit(pmu_handle, data_write, 2, 1000);
+                } else {
+                    ESP_LOGE(TAG, "Falha ao ler o AXP2101");
+                }
+                i2c_master_bus_rm_device(pmu_handle);
+            }
+        } else {
+             ESP_LOGE(TAG, "I2C Bus estÃ¡ NULO! NÃ£o Ã© possÃ­vel desligar o PMU.");
+        }
+    }
+    
+    // Atualiza o valor da bateria dinamicamente na watchface a cada 1 segundo
+    if (label_battery_watchface && current_screen == scr_watchface) {
+        current_battery_pct = read_battery_percentage();
+        
+        // Define o sÃ­mbolo correto com base na porcentagem usando os sÃ­mbolos nativos do LVGL
+        const char * sym = LV_SYMBOL_BATTERY_FULL;
+        if (current_battery_pct <= 10) sym = LV_SYMBOL_BATTERY_EMPTY;
+        else if (current_battery_pct <= 30) sym = LV_SYMBOL_BATTERY_1; // Equivale a 1/4
+        else if (current_battery_pct <= 60) sym = LV_SYMBOL_BATTERY_2; // Equivale a 2/4 (Metade)
+        else if (current_battery_pct <= 85) sym = LV_SYMBOL_BATTERY_3; // Equivale a 3/4
+
+        lv_label_set_text_fmt(label_battery_watchface, "%s %d%%", sym, current_battery_pct);
+        
+        // Muda para vermelho se estiver acabando
+        if (current_battery_pct <= 30) {
+            lv_obj_set_style_text_color(label_battery_watchface, lv_color_hex(0xFF0000), 0);
+        } else {
+            lv_obj_set_style_text_color(label_battery_watchface, lv_color_white(), 0);
+        }
+
+        // DetecÃ§Ã£o de USB/Carregamento via I2C (AXP2101 Reg 0x00)
+        bool usb_connected = false;
+        if (i2c_bus) {
+            i2c_device_config_t pmu_cfg = {};
+            pmu_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+            pmu_cfg.device_address = 0x34;
+            pmu_cfg.scl_speed_hz = 400000;
+            
+            i2c_master_dev_handle_t pmu_handle;
+            if (i2c_master_bus_add_device(i2c_bus, &pmu_cfg, &pmu_handle) == ESP_OK) {
+                uint8_t reg_status1 = 0x00;
+                uint8_t val = 0;
+                if (i2c_master_transmit_receive(pmu_handle, &reg_status1, 1, &val, 1, 1000) == ESP_OK) {
+                    // Bit 5 indica presenÃ§a de VBUS (Cabo USB conectado)
+                    usb_connected = (val & 0x20) != 0; 
+                }
+                i2c_master_bus_rm_device(pmu_handle);
+            }
+        }
+
+        // Exibe ou esconde o raio amarelo baseado no status do cabo
+        if (icon_charge_watchface) {
+            if (usb_connected) {
+                lv_obj_remove_flag(icon_charge_watchface, LV_OBJ_FLAG_HIDDEN);
+                
+                // Libera o botÃ£o (O LVGL muda a cor sozinho!)
+                if (btn_usb_settings && lv_obj_has_state(btn_usb_settings, LV_STATE_DISABLED)) {
+                    lv_obj_remove_state(btn_usb_settings, LV_STATE_DISABLED);
+                }
+            } else {
+                lv_obj_add_flag(icon_charge_watchface, LV_OBJ_FLAG_HIDDEN);
+                
+                // Bloqueia o botÃ£o (O LVGL muda a cor sozinho!)
+                if (btn_usb_settings && !lv_obj_has_state(btn_usb_settings, LV_STATE_DISABLED)) {
+                    lv_obj_add_state(btn_usb_settings, LV_STATE_DISABLED);
+                    if (usb_msc_started) set_usb_msc_state(false); // Garante o desligamento do pendrive
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------
+// ANIMAÃ‡ÃƒO DE BOOT (FADE BRANCO -> PRETO)
+// ---------------------------------------------------------
+static void boot_fade_anim_cb(void * var, int32_t v) {
+    lv_color_t bg = lv_color_mix(lv_color_black(), lv_color_white(), v);
+    lv_color_t text_main = lv_color_mix(lv_color_white(), lv_color_black(), v);
+    lv_color_t text_sec = lv_color_mix(lv_color_hex(0xAAAAAA), lv_color_black(), v);
+    lv_color_t text_gray = lv_color_mix(lv_color_hex(0x333333), lv_color_black(), v);
+
+    lv_obj_set_style_bg_color(scr_watchface, bg, 0);
+    lv_obj_set_style_text_color(time_label, text_main, 0);
+    lv_obj_set_style_text_color(date_label, text_sec, 0);
+    
+    // Wi-Fi: Se desligado termina cinza, se ligado termina branco
+    if (!wifi_started) {
+        lv_obj_set_style_text_color(icon_wifi_watchface, text_gray, 0);
+        if (icon_wifi_slash) lv_obj_set_style_text_color(icon_wifi_slash, text_gray, 0);
+    } else {
+        lv_obj_set_style_text_color(icon_wifi_watchface, text_main, 0);
+    }
+
+    // Bateria: Se <= 30% termina vermelho, senÃ£o termina branco
+    lv_color_t bat_target = (current_battery_pct <= 30) ? lv_color_hex(0xFF0000) : lv_color_white();
+    lv_color_t bat_color = lv_color_mix(bat_target, lv_color_black(), v);
+    lv_obj_set_style_text_color(label_battery_watchface, bat_color, 0);
+    lv_color_t yellow_target = lv_color_hex(0xFFD700); // Amarelo Ouro
+    lv_color_t yellow_color = lv_color_mix(yellow_target, lv_color_black(), v);
+    if (icon_charge_watchface) {
+        lv_obj_set_style_text_color(icon_charge_watchface, yellow_color, 0);
+    }
+}
+
+// Disparador seguro que vai rodar na memÃ³ria do motor grÃ¡fico
+static void start_anim_timer_cb(lv_timer_t * timer) {
+    // Declaramos como static para nÃ£o pesar no stack
+    static lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, scr_watchface);     
+    lv_anim_set_values(&a, 0, 255);         
+    lv_anim_set_time(&a, 1500);             
+    lv_anim_set_exec_cb(&a, boot_fade_anim_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out); 
+    lv_anim_start(&a);
+    
+    // Deleta este timer logo apÃ³s ligar a animaÃ§Ã£o (tiro Ãºnico)
+    lv_timer_delete(timer); 
+}
+
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "Iniciando sistema...");
+
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << BOOT_BTN_PIN);
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
+    init_wifi_basic();
+    bsp_display_start();
+
+    // Inicializa o CartÃ£o SD para uso local no boot
+    SdUsbManager::get_instance().init_local_storage();
+
+    bsp_display_lock(0);
+    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_white(), 0);
+    bsp_display_unlock();
+
+    i2c_bus = bsp_i2c_get_handle();
+
+    if (i2c_bus == NULL) {
+        ESP_LOGW(TAG, "BSP nÃ£o inicializou I2C. Inicializando manualmente...");
+        i2c_master_bus_config_t i2c_mst_config = {};
+        i2c_mst_config.clk_source = I2C_CLK_SRC_DEFAULT;
+        i2c_mst_config.i2c_port = -1;
+        i2c_mst_config.scl_io_num = GPIO_NUM_14;
+        i2c_mst_config.sda_io_num = GPIO_NUM_15;
+        i2c_mst_config.glitch_ignore_cnt = 7;
+        i2c_mst_config.flags.enable_internal_pullup = true;
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &i2c_bus));
+    }
+
+    // i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
+    i2c_device_config_t dev_cfg = {};
+    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev_cfg.device_address = 0x51; 
+    dev_cfg.scl_speed_hz = 400000; 
+    i2c_master_bus_add_device(i2c_bus, &dev_cfg, &rtc_handle);
+
+    uint8_t boot_sec = 0, boot_min = 0, boot_hour = 0;
+    uint8_t boot_day = 0, boot_month = 0;
+    uint16_t boot_year = 2000;
+
+    if (rtc_handle) {
+        uint8_t reg_addr = 0x04; 
+        uint8_t data[7] = {0};   
+        if (i2c_master_transmit_receive(rtc_handle, &reg_addr, 1, data, 7, 1000) == ESP_OK) {
+            boot_sec = bcd2dec(data[0] & 0x7F);
+            boot_min = bcd2dec(data[1] & 0x7F);
+            boot_hour = bcd2dec(data[2] & 0x3F);
+            boot_day = bcd2dec(data[3] & 0x3F);
+            boot_month = bcd2dec(data[5] & 0x1F);
+            boot_year = 2000 + bcd2dec(data[6]);
+        }
+    }
+
+    bsp_display_lock(0);
+
+    lv_display_t * disp = lv_display_get_default();
+    lv_display_add_event_cb(disp, align_pixels_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+
+    // --- CRIAÃ‡ÃƒO DAS TELAS ---
+    scr_watchface = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_watchface, lv_color_white(), 0); 
+    lv_obj_remove_flag(scr_watchface, LV_OBJ_FLAG_SCROLLABLE); 
+    lv_obj_add_event_cb(scr_watchface, watchface_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    scr_settings = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_settings, lv_color_black(), 0);  
+    lv_obj_remove_flag(scr_settings, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(scr_settings, screen_pressed_cb, LV_EVENT_PRESSED, NULL); 
+    lv_obj_add_event_cb(scr_settings, settings_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    scr_apps = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_apps, lv_color_black(), 0);    
+    lv_obj_remove_flag(scr_apps, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(scr_apps, apps_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    scr_wifi_list = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_wifi_list, lv_color_black(), 0);
+    lv_obj_add_event_cb(scr_wifi_list, screen_pressed_cb, LV_EVENT_PRESSED, NULL); 
+    lv_obj_add_event_cb(scr_wifi_list, wifi_list_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    scr_password = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_password, lv_color_black(), 0);
+    lv_obj_add_event_cb(scr_password, screen_pressed_cb, LV_EVENT_PRESSED, NULL); 
+    lv_obj_add_event_cb(scr_password, password_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    label_password_title = lv_label_create(scr_password);
+    lv_obj_set_style_text_color(label_password_title, lv_color_white(), 0); 
+    lv_obj_set_style_text_font(label_password_title, &lv_font_montserrat_20, 0);
+    lv_label_set_text(label_password_title, "Senha:");
+    lv_obj_align(label_password_title, LV_ALIGN_TOP_LEFT, 50, 30);
+
+    ta_password = lv_textarea_create(scr_password);
+    lv_textarea_set_password_mode(ta_password, false); 
+    lv_textarea_set_one_line(ta_password, true);
+    lv_obj_set_width(ta_password, 310);
+    lv_obj_align(ta_password, LV_ALIGN_TOP_MID, 0, 70); 
+    lv_obj_add_event_cb(ta_password, [](lv_event_t *e) {
+        reset_inactivity_timer();
+    }, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(ta_password, screen_pressed_cb, LV_EVENT_PRESSED, NULL);
+
+    kb_password = lv_keyboard_create(scr_password);
+    lv_keyboard_set_textarea(kb_password, ta_password);
+    // [NOVO] Afasta os botÃµes das bordas curvas do display
+    lv_obj_set_style_pad_left(kb_password, 15, 0);   // Empurra a margem esquerda
+    lv_obj_set_style_pad_right(kb_password, 15, 0);  // Empurra a margem direita
+    lv_obj_set_style_pad_bottom(kb_password, 15, 0); // Sobe os botÃµes inferiores
+
+    lv_obj_add_event_cb(kb_password, [](lv_event_t *e) {
+        reset_inactivity_timer();
+    }, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(kb_password, keyboard_ready_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(kb_password, keyboard_cancel_cb, LV_EVENT_CANCEL, NULL);
+    lv_obj_add_event_cb(kb_password, screen_pressed_cb, LV_EVENT_PRESSED, NULL); 
+
+    // --- [INÃCIO DA TELA DO PENDRIVE] ---
+    scr_usb_msc = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_usb_msc, lv_color_black(), 0);
+    lv_obj_remove_flag(scr_usb_msc, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(scr_usb_msc, screen_pressed_cb, LV_EVENT_PRESSED, NULL); 
+    lv_obj_add_event_cb(scr_usb_msc, global_touch_intercept_cb, LV_EVENT_PRESSED, NULL); // MantÃ©m o brilho acordado no toque
+
+    // Ãcone gigante de USB
+    lv_obj_t * usb_msc_big_icon = lv_label_create(scr_usb_msc);
+    lv_label_set_text(usb_msc_big_icon, LV_SYMBOL_USB);
+    lv_obj_set_style_text_font(usb_msc_big_icon, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(usb_msc_big_icon, lv_color_hex(0x007BFF), 0);
+    lv_obj_align(usb_msc_big_icon, LV_ALIGN_CENTER, 0, -60);
+
+    // Texto informativo
+    lv_obj_t * usb_msc_label = lv_label_create(scr_usb_msc);
+    lv_label_set_text(usb_msc_label, "Modo Pendrive Ativo\nNao remova o cabo");
+    lv_obj_set_style_text_align(usb_msc_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(usb_msc_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(usb_msc_label, lv_color_white(), 0);
+    lv_obj_align(usb_msc_label, LV_ALIGN_CENTER, 0, 10);
+
+    // BotÃ£o de Desconectar e Reiniciar
+    lv_obj_t * btn_disconnect_usb = lv_button_create(scr_usb_msc);
+    lv_obj_set_size(btn_disconnect_usb, 180, 50);
+    lv_obj_align(btn_disconnect_usb, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_set_style_bg_color(btn_disconnect_usb, lv_color_hex(0xFF3333), 0); // Vermelho
+    lv_obj_set_style_radius(btn_disconnect_usb, 25, 0);
+
+    lv_obj_t * lbl_disconnect = lv_label_create(btn_disconnect_usb);
+    lv_label_set_text(lbl_disconnect, "Desconectar");
+    lv_obj_set_style_text_font(lbl_disconnect, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_disconnect, lv_color_white(), 0);
+    lv_obj_center(lbl_disconnect);
+
+    lv_obj_add_event_cb(btn_disconnect_usb, [](lv_event_t *e) {
+        set_usb_msc_state(false); // Dispara o processo de desligamento
+    }, LV_EVENT_CLICKED, NULL);
+
+    // Vincular o interceptor de toque nas telas para monitorar atividade
+    lv_obj_add_event_cb(scr_watchface, global_touch_intercept_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(scr_settings, global_touch_intercept_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(scr_apps, global_touch_intercept_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(scr_wifi_list, global_touch_intercept_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(scr_password, global_touch_intercept_cb, LV_EVENT_PRESSED, NULL);
+
+    // ---------------------------------------------------------
+    // COMPONENTES DO WATCHFACE (Android Style Top Right)
+    // ---------------------------------------------------------
+    
+    // 1. Mostrador de Bateria (Recuado de -20 para -45 para fugir da borda arredondada)
+    label_battery_watchface = lv_label_create(scr_watchface);
+    lv_obj_set_style_text_color(label_battery_watchface, lv_color_black(), 0);
+    lv_obj_set_style_text_font(label_battery_watchface, &lv_font_montserrat_14, 0);
+    
+    current_battery_pct = read_battery_percentage();
+    const char * sym = LV_SYMBOL_BATTERY_FULL;
+    if (current_battery_pct <= 10) sym = LV_SYMBOL_BATTERY_EMPTY;
+    else if (current_battery_pct <= 30) sym = LV_SYMBOL_BATTERY_1;
+    else if (current_battery_pct <= 60) sym = LV_SYMBOL_BATTERY_2;
+    else if (current_battery_pct <= 85) sym = LV_SYMBOL_BATTERY_3;
+    
+    lv_label_set_text_fmt(label_battery_watchface, "%s %d%%", sym, current_battery_pct);
+    lv_obj_align(label_battery_watchface, LV_ALIGN_TOP_RIGHT, -45, 23); // Movido para a esquerda
+
+    // [NOVO] 1.5. Ãcone do Raio de Carregamento (Fica colado Ã  esquerda do texto da bateria)
+    icon_charge_watchface = lv_label_create(scr_watchface);
+    lv_label_set_text(icon_charge_watchface, LV_SYMBOL_CHARGE);
+    lv_obj_set_style_text_font(icon_charge_watchface, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(icon_charge_watchface, lv_color_black(), 0); // Inicia preto para o boot fade
+    lv_obj_align_to(icon_charge_watchface, label_battery_watchface, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+    lv_obj_add_flag(icon_charge_watchface, LV_OBJ_FLAG_HIDDEN); // Oculto por padrÃ£o
+
+    // 2. Ãcone do Wi-Fi (Deslocado de -85 para -130 acompanhando o bloco)
+    icon_wifi_watchface = lv_label_create(scr_watchface);
+    lv_label_set_text(icon_wifi_watchface, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(icon_wifi_watchface, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(icon_wifi_watchface, lv_color_black(), 0); 
+    lv_obj_align(icon_wifi_watchface, LV_ALIGN_TOP_RIGHT, -130, 20); // Movido para a esquerda
+
+    // 3. Barra diagonal indicando Wi-Fi off
+    icon_wifi_slash = lv_label_create(scr_watchface);
+    lv_label_set_text(icon_wifi_slash, "/");
+    lv_obj_set_style_text_font(icon_wifi_slash, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(icon_wifi_slash, lv_color_black(), 0);
+    lv_obj_align_to(icon_wifi_slash, icon_wifi_watchface, LV_ALIGN_CENTER, 0, 0);
+    
+    if (wifi_started) {
+        lv_obj_add_flag(icon_wifi_slash, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    time_label = lv_label_create(scr_watchface);
+    lv_obj_set_style_text_color(time_label, lv_color_black(), 0);
+    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_48, 0);
+    lv_label_set_text_fmt(time_label, "%02d:%02d:%02d", boot_hour, boot_min, boot_sec); 
+    lv_obj_align(time_label, LV_ALIGN_CENTER, 0, -20);
+
+    date_label = lv_label_create(scr_watchface);
+    lv_obj_set_style_text_color(date_label, lv_color_black(), 0);
+    lv_obj_set_style_text_font(date_label, &lv_font_montserrat_30, 0);
+    if (boot_day != 0) {
+        lv_label_set_text_fmt(date_label, "%02d/%02d/%04d", boot_day, boot_month, boot_year);
+    } else {
+        lv_label_set_text(date_label, "--/--/----"); 
+    }
+    lv_obj_align(date_label, LV_ALIGN_CENTER, 0, 30);
+
+
+    // COMPONENTES DO SETTINGS
+    lv_obj_t * label_settings_title = lv_label_create(scr_settings);
+    lv_obj_set_style_text_color(label_settings_title, lv_color_white(), 0); 
+    lv_obj_set_style_text_font(label_settings_title, &lv_font_montserrat_20, 0);
+    lv_label_set_text(label_settings_title, "Configuracoes"); 
+    lv_obj_align(label_settings_title, LV_ALIGN_TOP_MID, 0, 20);
+
+    // BotÃ£o do Wi-Fi
+    btn_wifi_settings = lv_button_create(scr_settings);
+    lv_obj_set_size(btn_wifi_settings, 80, 80); 
+    lv_obj_set_style_radius(btn_wifi_settings, LV_RADIUS_CIRCLE, 0); 
+    lv_obj_set_style_bg_color(btn_wifi_settings, lv_color_hex(0x333333), 0); 
+    lv_obj_align(btn_wifi_settings, LV_ALIGN_TOP_MID, -80, 110);
+
+    lv_obj_t * label_wifi_icon = lv_label_create(btn_wifi_settings);
+    lv_label_set_text(label_wifi_icon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(label_wifi_icon, &lv_font_montserrat_30, 0);
+    lv_obj_center(label_wifi_icon);
+
+    lv_obj_add_event_cb(btn_wifi_settings, wifi_btn_short_click_cb, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_add_event_cb(btn_wifi_settings, wifi_btn_long_cb, LV_EVENT_LONG_PRESSED, NULL);
+
+    // BotÃ£o do Modo Pendrive posicionado ao lado do Wi-Fi
+    btn_usb_settings = lv_button_create(scr_settings);
+    lv_obj_set_size(btn_usb_settings, 80, 80); 
+    lv_obj_set_style_radius(btn_usb_settings, LV_RADIUS_CIRCLE, 0); 
+    
+    // 1. ForÃ§a opacidade total para evitar que o tema padrÃ£o do LVGL deixe o botÃ£o translÃºcido/claro
+    lv_obj_set_style_bg_opa(btn_usb_settings, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(btn_usb_settings, LV_OPA_COVER, LV_STATE_DISABLED);
+    
+    // 2. Define o Background do botÃ£o
+    lv_obj_set_style_bg_color(btn_usb_settings, lv_color_hex(0x333333), 0);                  // Normal
+    lv_obj_set_style_bg_color(btn_usb_settings, lv_color_hex(0x111111), LV_STATE_DISABLED); // Bloqueado
+    
+    // 3. Define a cor do texto/Ã­cone DIRETAMENTE NO PAI. A label herdarÃ¡ isso magicamente.
+    lv_obj_set_style_text_color(btn_usb_settings, lv_color_white(), 0);                      // Ãcone Normal
+    lv_obj_set_style_text_color(btn_usb_settings, lv_color_hex(0x444444), LV_STATE_DISABLED);// Ãcone Bloqueado
+    
+    lv_obj_align(btn_usb_settings, LV_ALIGN_TOP_MID, 80, 110); 
+
+    lv_obj_t * label_usb_icon = lv_label_create(btn_usb_settings);
+    lv_label_set_text(label_usb_icon, LV_SYMBOL_USB);
+    lv_obj_set_style_text_font(label_usb_icon, &lv_font_montserrat_30, 0);
+    // Removemos os estilos de cor que estavam no label
+    lv_obj_center(label_usb_icon);
+
+    lv_obj_add_event_cb(btn_usb_settings, [](lv_event_t *e) {
+        set_usb_msc_state(!usb_msc_started);
+    }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_state(btn_usb_settings, LV_STATE_DISABLED); // Inicia bloqueado
+
+    // [NOVO] Controle de Brilho
+    lv_obj_t * label_brightness = lv_label_create(scr_settings);
+    lv_obj_set_style_text_color(label_brightness, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(label_brightness, &lv_font_montserrat_20, 0);
+    lv_label_set_text(label_brightness, "Brilho");
+    lv_obj_align(label_brightness, LV_ALIGN_BOTTOM_MID, 0, -100);
+
+    slider_brightness = lv_slider_create(scr_settings);
+    lv_obj_set_size(slider_brightness, 240, 20); // Barra larga e gorda para facilitar o toque
+    lv_obj_align(slider_brightness, LV_ALIGN_BOTTOM_MID, 0, -60);
+    lv_slider_set_range(slider_brightness, 10, 100); // 10% mÃ­nimo para nÃ£o apagar a tela por completo
+    lv_slider_set_value(slider_brightness, 80, LV_ANIM_OFF); // PadrÃ£o de 80%
+    lv_obj_add_event_cb(slider_brightness, brightness_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+
+    // COMPONENTES DA LISTA DE WI-FI
+    lv_obj_t * label_list_header = lv_label_create(scr_wifi_list);
+    lv_obj_set_style_text_color(label_list_header, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label_list_header, &lv_font_montserrat_20, 0);
+    lv_label_set_text(label_list_header, "Wi-Fi"); 
+    lv_obj_align(label_list_header, LV_ALIGN_TOP_LEFT, 50, 30); 
+
+    sw_wifi_list = lv_switch_create(scr_wifi_list);
+    lv_obj_align(sw_wifi_list, LV_ALIGN_TOP_RIGHT, -50, 25); 
+    lv_obj_add_event_cb(sw_wifi_list, wifi_list_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    list_wifi = lv_list_create(scr_wifi_list);
+    lv_obj_set_size(list_wifi, 310, 380); 
+    lv_obj_align(list_wifi, LV_ALIGN_TOP_MID, 0, 80); 
+    lv_obj_set_style_bg_color(list_wifi, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(list_wifi, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(list_wifi, 0, 0);
+    // Adiciona o reset no scroll
+    lv_obj_add_event_cb(list_wifi, [](lv_event_t * e) {
+        reset_inactivity_timer();
+    }, LV_EVENT_SCROLL, NULL);
+    lv_obj_add_event_cb(list_wifi, screen_pressed_cb, LV_EVENT_PRESSED, NULL);
+
+
+    // COMPONENTES DO APPS E GRID
+    lv_obj_t * label_apps = lv_label_create(scr_apps);
+    lv_obj_set_style_text_color(label_apps, lv_color_white(), 0); 
+    lv_obj_set_style_text_font(label_apps, &lv_font_montserrat_20, 0);
+    lv_label_set_text(label_apps, "Aplicativos"); 
+    lv_obj_align(label_apps, LV_ALIGN_TOP_MID, 0, 30);
+
+    // Container que atuarÃ¡ como Grid automÃ¡tico
+    lv_obj_t * app_grid = lv_obj_create(scr_apps);
+    lv_obj_set_size(app_grid, 340, 350);
+    lv_obj_align(app_grid, LV_ALIGN_BOTTOM_MID, 0, -30);
+    lv_obj_set_style_bg_opa(app_grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(app_grid, 0, 0);
+    
+    // Configura o Flexbox com ROW_WRAP (Cria o Grid dinÃ¢mico)
+    lv_obj_set_flex_flow(app_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(app_grid, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    // APP 1: Informacoes de Rede (Com Icone e Legenda)
+    lv_obj_t * btn_app_netinfo = lv_button_create(app_grid);
+    lv_obj_set_size(btn_app_netinfo, 90, 90); 
+    lv_obj_set_style_radius(btn_app_netinfo, 20, 0); 
+    lv_obj_set_style_bg_color(btn_app_netinfo, lv_color_hex(0x222222), 0);
+    lv_obj_add_event_cb(btn_app_netinfo, app_netinfo_click_cb, LV_EVENT_CLICKED, NULL);
+
+    // Ajusta o layout interno do botao para organizar itens em Coluna centralizada
+    lv_obj_set_flex_flow(btn_app_netinfo, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn_app_netinfo, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(btn_app_netinfo, 2, 0); // Espacamento entre o icone e o texto
+
+    // 1. Icone (Em cima) - Corrigido para fonte tamanho 20 disponivel no sistema
+    lv_obj_t * icon_app_netinfo = lv_label_create(btn_app_netinfo);
+    lv_label_set_text(icon_app_netinfo, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(icon_app_netinfo, &lv_font_montserrat_20, 0);
+
+    // 2. Legenda (Embaixo) - Corrigido para fonte tamanho 14 disponivel no sistema
+    lv_obj_t * label_app_title = lv_label_create(btn_app_netinfo);
+    lv_label_set_text(label_app_title, "NET INFO");
+    lv_obj_set_style_text_font(label_app_title, &lv_font_montserrat_14, 0); 
+    lv_obj_set_style_text_color(label_app_title, lv_color_hex(0xDDDDDD), 0);
+
+    // TELA DO APP 1: Inicializada de forma limpa pelo componente externo
+    app_netinfo_init();
+
+    // APP 2: Sys Info
+    lv_obj_t * btn_app_sys = lv_button_create(app_grid);
+    lv_obj_set_size(btn_app_sys, 90, 90); 
+    lv_obj_set_style_radius(btn_app_sys, 20, 0); 
+    lv_obj_set_style_bg_color(btn_app_sys, lv_color_hex(0x222222), 0);
+    lv_obj_set_flex_flow(btn_app_sys, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn_app_sys, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Callback para abrir o app
+    lv_obj_add_event_cb(btn_app_sys, [](lv_event_t *e){
+        app_sysinfo_update();
+        lv_scr_load_anim(app_sysinfo_get_screen(), LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * icon_app_sys = lv_label_create(btn_app_sys);
+    lv_label_set_text(icon_app_sys, LV_SYMBOL_SETTINGS); 
+    lv_obj_set_style_text_font(icon_app_sys, &lv_font_montserrat_20, 0);
+
+    lv_obj_t * title_app_sys = lv_label_create(btn_app_sys);
+    lv_label_set_text(title_app_sys, "SYS INFO");
+    lv_obj_set_style_text_font(title_app_sys, &lv_font_montserrat_14, 0);
+
+    // APP 3: Ferramentas de Rede (Com Ãcone e Legenda)
+    lv_obj_t * btn_app_tools = lv_button_create(app_grid);
+    lv_obj_set_size(btn_app_tools, 90, 90); 
+    lv_obj_set_style_radius(btn_app_tools, 20, 0); 
+    lv_obj_set_style_bg_color(btn_app_tools, lv_color_hex(0x222222), 0);
+
+    lv_obj_set_flex_flow(btn_app_tools, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn_app_tools, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(btn_app_tools, 2, 0);
+
+    lv_obj_add_event_cb(btn_app_tools, [](lv_event_t *e){
+        lv_scr_load_anim(app_nettools_get_screen(), LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * icon_app_tools = lv_label_create(btn_app_tools);
+    lv_label_set_text(icon_app_tools, LV_SYMBOL_DIRECTORY); // Ãcone de listagem/ferramentas do LVGL
+    lv_obj_set_style_text_font(icon_app_tools, &lv_font_montserrat_20, 0);
+
+    lv_obj_t * label_tools_title = lv_label_create(btn_app_tools);
+    lv_label_set_text(label_tools_title, "NET TOOLS");
+    lv_obj_set_style_text_font(label_tools_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label_tools_title, lv_color_hex(0xDDDDDD), 0);
+
+    // APP 4: File Explorer
+    lv_obj_t * btn_app_files = lv_button_create(app_grid);
+    lv_obj_set_size(btn_app_files, 90, 90); 
+    lv_obj_set_style_radius(btn_app_files, 20, 0); 
+    lv_obj_set_style_bg_color(btn_app_files, lv_color_hex(0x222222), 0);
+    lv_obj_set_flex_flow(btn_app_files, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn_app_files, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_add_event_cb(btn_app_files, [](lv_event_t *e){
+        lv_scr_load_anim(app_file_explorer_get_screen(), LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * icon_app_files = lv_label_create(btn_app_files);
+    lv_label_set_text(icon_app_files, LV_SYMBOL_DIRECTORY); 
+    lv_obj_set_style_text_font(icon_app_files, &lv_font_montserrat_20, 0);
+
+    lv_obj_t * title_app_files = lv_label_create(btn_app_files);
+    lv_label_set_text(title_app_files, "FILES");
+    lv_obj_set_style_text_font(title_app_files, &lv_font_montserrat_14, 0);
+
+    // APP 5: Emulador GBC
+    lv_obj_t * btn_app_gbc = lv_button_create(app_grid);
+    lv_obj_set_size(btn_app_gbc, 90, 90); 
+    lv_obj_set_style_radius(btn_app_gbc, 20, 0); 
+    lv_obj_set_style_bg_color(btn_app_gbc, lv_color_hex(0x222222), 0);
+    lv_obj_set_flex_flow(btn_app_gbc, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn_app_gbc, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_add_event_cb(btn_app_gbc, [](lv_event_t *e){
+        lv_scr_load_anim(app_gbc_emulator_get_screen(), LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, false);
+    }, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * icon_app_gbc = lv_label_create(btn_app_gbc);
+    lv_label_set_text(icon_app_gbc, LV_SYMBOL_PLAY); 
+    lv_obj_set_style_text_font(icon_app_gbc, &lv_font_montserrat_20, 0);
+
+    lv_obj_t * title_app_gbc = lv_label_create(btn_app_gbc);
+    lv_label_set_text(title_app_gbc, "GBC EMU");
+    lv_obj_set_style_text_font(title_app_gbc, &lv_font_montserrat_14, 0);
+
+    // Inicializa o app
+    app_sysinfo_init();
+    app_nettools_init();
+    app_file_explorer_init();
+    app_gbc_emulator_init();
+
+    // CARREGA A TELA PRINCIPAL
+    lv_screen_load(scr_watchface);
+    
+    lv_timer_create(update_time_timer_cb, 1000, NULL);
+    lv_timer_create(home_btn_timer_cb, 50, NULL); 
+
+    // Inicializa o temporizador de atividade no momento de boot
+    last_activity_time = lv_tick_get();
+
+    // Cria um timer periÃ³dico global rodando a cada 1 segundo para avaliar o estado de energia
+    lv_timer_create(check_power_management_timer_cb, 1000, NULL);
+
+    // [NOVO] Dispara a animaÃ§Ã£o de Fade In
+    lv_timer_create(start_anim_timer_cb, 400, NULL);
+
+    bsp_display_unlock();
+}
+
+=== ARQUIVO: main/ ===
+
+#include "SdUsbManager.hpp"
+#include "esp_log.h"
+#include "esp_vfs_fat.h"
+#include "tinyusb.h"
+#include "tusb_msc_storage.h"
+#include "driver/gpio.h" // [NOVO] NecessÃ¡rio para manipular os pinos USB
+
+// Pinos do SD Card confirmados via diagrama da Waveshare
+#define PIN_NUM_MOSI 1
+#define PIN_NUM_CLK  2
+#define PIN_NUM_MISO 3
+#define PIN_NUM_CS   17 
+
+static const char *TAG = "SdUsbMgr";
+
+esp_err_t SdUsbManager::init_local_storage() {
+    if (sd_initialized && !msc_active) return ESP_OK;
+
+    ESP_LOGI(TAG, "Montando Cartao SD no ESP32...");
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    
+    // ForÃ§a o uso do SPI3_HOST para nÃ£o conflitar com o Display AMOLED (SPI2_HOST)
+    host.slot = SPI3_HOST; 
+    
+    spi_bus_config_t bus_cfg = {};
+    bus_cfg.mosi_io_num = PIN_NUM_MOSI;
+    bus_cfg.miso_io_num = PIN_NUM_MISO;
+    bus_cfg.sclk_io_num = PIN_NUM_CLK;
+    bus_cfg.quadwp_io_num = -1;
+    bus_cfg.quadhd_io_num = -1;
+    bus_cfg.max_transfer_sz = 4000;
+
+    // Inicializa no SPI3. Ignora se jÃ¡ estiver ligado.
+    esp_err_t err = spi_bus_initialize((spi_host_device_t)host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Falha ao inicializar barramento SPI: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = (gpio_num_t)PIN_NUM_CS;
+    slot_config.host_id = (spi_host_device_t)host.slot;
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
+    mount_config.format_if_mount_failed = false;
+    mount_config.max_files = 5;
+    mount_config.allocation_unit_size = 16 * 1024;
+
+    esp_err_t ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao montar SD Card (0x%x). Verifique os pinos/cartao.", ret);
+        return ret;
+    }
+
+    sd_initialized = true;
+    msc_active = false;
+    ESP_LOGI(TAG, "SD Card montado com sucesso em %s", mount_point);
+    return ESP_OK;
+}
+
+esp_err_t SdUsbManager::enable_usb_msc() {
+    if (msc_active) return ESP_OK;
+
+    // Trava anti-crash. Se nÃ£o houver SD Card, o botÃ£o nÃ£o faz nada e nÃ£o reinicia a placa.
+    if (card == nullptr) {
+        ESP_LOGE(TAG, "Cartao SD nao foi inicializado no boot! Abortando MSC para evitar Crash.");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Iniciando TinyUSB MSC...");
+    
+    tinyusb_config_t tusb_cfg = {};
+    
+    esp_err_t ret = tinyusb_driver_install(&tusb_cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Falha ao instalar TinyUSB");
+        return ret;
+    }
+
+    tinyusb_msc_sdmmc_config_t msc_config = {};
+    msc_config.card = card;
+
+    ret = tinyusb_msc_storage_init_sdmmc(&msc_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao vincular SD ao TinyUSB");
+        return ret;
+    }
+
+    msc_active = true;
+    ESP_LOGI(TAG, "Modo Pendrive Ativo! Conecte no PC.");
+    return ESP_OK;
+}
+
+esp_err_t SdUsbManager::disable_usb_msc() {
+    if (!msc_active) return ESP_OK;
+
+    ESP_LOGI(TAG, "Saindo do Modo Pendrive. O sistema sera reiniciado para restaurar o Monitor Serial...");
+
+    // 1. Derruba fisicamente os pinos USB internos do ESP32-S3 (GPIO 19 e 20)
+    // Isso forÃ§a o Windows a registrar a remoÃ§Ã£o do Pendrive IMEDIATAMENTE.
+    gpio_reset_pin(GPIO_NUM_19);
+    gpio_reset_pin(GPIO_NUM_20);
+    gpio_set_direction(GPIO_NUM_19, GPIO_MODE_INPUT);
+    gpio_set_direction(GPIO_NUM_20, GPIO_MODE_INPUT);
+
+    // 2. Aguarda 2.5 segundos para o PC tocar o som de "desconectado" e limpar a porta COM
+    vTaskDelay(pdMS_TO_TICKS(2500));
+
+    // 3. Reinicia o ESP32 graciosamente. O Bootloader vai restaurar o USB JTAG/Serial automaticamente.
+    esp_restart();
+
+    return ESP_OK; // O cÃ³digo nunca chegarÃ¡ aqui devido ao reboot
+}
+
+=== ARQUIVO: main/ ===
+
+#pragma once
+
+#include "esp_err.h"
+#include "sdmmc_cmd.h"
+
+class SdUsbManager {
+public:
+    // PadrÃ£o Singleton - Apenas uma instÃ¢ncia controlando o hardware
+    static SdUsbManager& get_instance() {
+        static SdUsbManager instance;
+        return instance;
+    }
+
+    // Inicializa o barramento SDMMC e monta para o ESP32 (Uso interno)
+    esp_err_t init_local_storage();
+
+    // Alterna para o modo USB (Desmonta do ESP32, expÃµe para o PC)
+    esp_err_t enable_usb_msc();
+
+    // Alterna para o modo Local (Desconecta do PC, remonta no ESP32)
+    esp_err_t disable_usb_msc();
+
+    // Verifica se o modo pendrive estÃ¡ ativo
+    bool is_msc_active() const { return msc_active; }
+
+private:
+    SdUsbManager() = default;
+    ~SdUsbManager() = default;
+
+    // Previne cÃ³pias (Clean Code)
+    SdUsbManager(const SdUsbManager&) = delete;
+    SdUsbManager& operator=(const SdUsbManager&) = delete;
+
+    sdmmc_card_t* card = nullptr;
+    bool msc_active = false;
+    bool sd_initialized = false;
+    
+    const char* mount_point = "/sdcard";
+};
