@@ -612,8 +612,9 @@ static void refresh_rom_list() {
                 // Usa diretamente o nome do arquivo (ent->d_name)
                 lv_obj_t *btn = lv_list_add_button(list_roms, LV_SYMBOL_PLAY, ent->d_name);
                 
-                lv_obj_set_style_bg_color(btn, lv_color_hex(0x111111), 0);
+                lv_obj_set_style_bg_color(btn, lv_color_black(), 0);
                 lv_obj_set_style_text_color(btn, lv_color_white(), 0);
+                lv_obj_set_style_text_font(btn, &lv_font_montserrat_20, 0);
                 lv_obj_set_style_border_width(btn, 0, 0);
                 lv_obj_set_style_pad_all(btn, 20, 0);
                 
@@ -625,6 +626,7 @@ static void refresh_rom_list() {
         lv_obj_t *lbl = lv_list_add_text(list_roms, "Crie a pasta /GB e adicione jogos.");
         lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
         lv_obj_set_style_bg_color(lbl, lv_color_black(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
     }
 }
 
