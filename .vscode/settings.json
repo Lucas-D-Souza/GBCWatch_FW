@@ -4,7 +4,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.currentSetup": "/home/duarte/.espressif/v5.4.4/esp-idf",
+  "idf.currentSetup": "/home/lucas/.espressif/v5.4.4/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
@@ -16,5 +16,5 @@
   ],
   "idf.flashType": "UART",
   "idf.portWin": "COM3",
-  "idf.port": "/dev/ttyACM1"
+  "idf.port": "/dev/ttyACM0"
 }

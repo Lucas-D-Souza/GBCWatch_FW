@@ -9,6 +9,9 @@ idf_component_register(
         "."
         "gnuboy"
     REQUIRES 
+        "esp_wifi"
+        "esp_event"
+        "esp_netif"
         "app_update"
         "esp_partition"
         "bsp_board_extra"

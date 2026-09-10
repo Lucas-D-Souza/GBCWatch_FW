@@ -16,6 +16,16 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "driver/i2c_master.h"
+#include "esp_wifi.h"
+#include "lwip/sockets.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "arpa/inet.h"
+
+// Variáveis do Modo TV
+static bool tv_mode_enabled = false;
+static int udp_socket = -1;
+static struct sockaddr_in tv_addr;
 
 // Globais da Bateria
 static lv_obj_t *icon_batt_warning = NULL;
@@ -182,36 +192,61 @@ static void emulator_task(void* arg) {
             }
         }
 
-        // --- 4. RENDERIZAÇÃO DE VÍDEO (Pula 1 Quadro) ---
+        // --- 4. RENDERIZAÇÃO DE VÍDEO ---
         if (draw_this_frame) {
-            for (int chunk = 0; chunk < (144 / CHUNK_LINES); chunk++) {
-                int src_y = chunk * CHUNK_LINES;
-                for (int y = 0; y < CHUNK_LINES; y++) {
-                    uint32_t *src_row_32 = (uint32_t*)&gnuboy_fb[(src_y + y) * 160];
-                    uint32_t *dst_row1 = (uint32_t*)dma_buffer[current_buf] + (y * 2) * 160;
-                    uint32_t *dst_row2 = (uint32_t*)dma_buffer[current_buf] + (y * 2 + 1) * 160;
+            
+            if (tv_mode_enabled && udp_socket != -1) {
+                // MODO TV: Envia via Wi-Fi (UDP Cast)
+                // Vamos enviar 4 linhas por pacote (160 pixels * 2 bytes * 4 = 1280 bytes)
+                // Cabeçalho de 2 bytes: [Frame_Counter] [Linha_Y_Inicial]
+                static uint8_t frame_seq = 0;
+                frame_seq++;
 
-                    for (int x = 0; x < 80; x++) {
-                        uint32_t dp = src_row_32[x]; 
-                        uint32_t ca = ((dp & 0xFFFF) << 16) | (dp & 0xFFFF);
-                        uint32_t cb = ((dp >> 16) << 16) | (dp >> 16);
-                        int dst_idx = x * 2;
-                        dst_row1[dst_idx] = ca; dst_row1[dst_idx + 1] = cb;
-                        dst_row2[dst_idx] = ca; dst_row2[dst_idx + 1] = cb;
+                uint8_t packet[1282]; 
+                packet[0] = frame_seq; // Ajuda a TV a ignorar pacotes atrasados
+
+                for (int y = 0; y < 144; y += 4) {
+                    packet[1] = y; // Diz para a TV onde esse bloco de pixels começa
+                    
+                    // Copia as 4 linhas direto do Framebuffer bruto do Gnuboy
+                    memcpy(&packet[2], &gnuboy_fb[y * 160], 1280);
+                    
+                    // Atira na rede! (Até o momento, vamos mandar para Broadcast para testar fácil)
+                    sendto(udp_socket, packet, sizeof(packet), 0, (struct sockaddr *)&tv_addr, sizeof(tv_addr));
+                }
+                frames_draw++;
+
+            } else {
+                // MODO LOCAL: Desenha na tela do Relógio (Código DMA que você já possui)
+                for (int chunk = 0; chunk < (144 / CHUNK_LINES); chunk++) {
+                    int src_y = chunk * CHUNK_LINES;
+                    for (int y = 0; y < CHUNK_LINES; y++) {
+                        uint32_t *src_row_32 = (uint32_t*)&gnuboy_fb[(src_y + y) * 160];
+                        uint32_t *dst_row1 = (uint32_t*)dma_buffer[current_buf] + (y * 2) * 160;
+                        uint32_t *dst_row2 = (uint32_t*)dma_buffer[current_buf] + (y * 2 + 1) * 160;
+
+                        for (int x = 0; x < 80; x++) {
+                            uint32_t dp = src_row_32[x]; 
+                            uint32_t ca = ((dp & 0xFFFF) << 16) | (dp & 0xFFFF);
+                            uint32_t cb = ((dp >> 16) << 16) | (dp >> 16);
+                            int dst_idx = x * 2;
+                            dst_row1[dst_idx] = ca; dst_row1[dst_idx + 1] = cb;
+                            dst_row2[dst_idx] = ca; dst_row2[dst_idx + 1] = cb;
+                        }
                     }
+                    lv_area_t area = {
+                        .x1 = 45, .y1 = 15 + (chunk * SCALED_CHUNK_LINES),
+                        .x2 = 45 + 320 - 1, .y2 = 15 + (chunk * SCALED_CHUNK_LINES) + SCALED_CHUNK_LINES - 1
+                    };
+                    if (lvgl_port_lock(pdMS_TO_TICKS(10))) {
+                        lv_display_t * disp = lv_display_get_default();
+                        if (disp && disp->flush_cb) disp->flush_cb(disp, &area, (uint8_t*)dma_buffer[current_buf]);
+                        lvgl_port_unlock();
+                    }
+                    current_buf = !current_buf; 
                 }
-                lv_area_t area = {
-                    .x1 = 45, .y1 = 15 + (chunk * SCALED_CHUNK_LINES),
-                    .x2 = 45 + 320 - 1, .y2 = 15 + (chunk * SCALED_CHUNK_LINES) + SCALED_CHUNK_LINES - 1
-                };
-                if (lvgl_port_lock(pdMS_TO_TICKS(10))) {
-                    lv_display_t * disp = lv_display_get_default();
-                    if (disp && disp->flush_cb) disp->flush_cb(disp, &area, (uint8_t*)dma_buffer[current_buf]);
-                    lvgl_port_unlock();
-                }
-                current_buf = !current_buf; 
+                frames_draw++;
             }
-            frames_draw++;
         }
         
         frames_logic++;
@@ -311,6 +346,61 @@ static void start_game(const char* path) {
 
     strncpy(current_rom_path, path, sizeof(current_rom_path));
 
+    // --- NOVO: LIGA O WI-FI E O SOCKET SE O MODO TV ESTIVER ATIVADO ---
+    if (tv_mode_enabled) {
+        ESP_LOGI(TAG, "Iniciando Wi-Fi para o Modo TV...");
+        
+        esp_netif_init();
+        esp_event_loop_create_default();
+        esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+        
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        esp_wifi_init(&cfg);
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        
+        wifi_config_t wifi_config = {};
+        // === COLOQUE SEU WI-FI AQUI ===
+        strcpy((char*)wifi_config.sta.ssid, "");
+        strcpy((char*)wifi_config.sta.password, "");
+        // ==============================
+        
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        esp_wifi_start();
+        esp_wifi_connect();
+        
+        ESP_LOGI(TAG, "Aguardando o roteador liberar o IP...");
+        
+        esp_netif_ip_info_t ip_info;
+        ip_info.ip.addr = 0;
+        int retries = 0;
+        
+        // Fica preso aqui por no máximo 15 segundos esperando a rede
+        while (ip_info.ip.addr == 0 && retries < 15) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            esp_netif_get_ip_info(netif, &ip_info);
+            retries++;
+            if (retries % 5 == 0) esp_wifi_connect(); // Força reconexão se o roteador ignorar
+            ESP_LOGI(TAG, "Tentativa %d de 15...", retries);
+        }
+
+        if (ip_info.ip.addr != 0) {
+            ESP_LOGI(TAG, "Wi-Fi Conectado com Sucesso! IP: " IPSTR, IP2STR(&ip_info.ip));
+            
+            udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            int broadcastEnable = 1;
+            setsockopt(udp_socket, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+
+            tv_addr.sin_family = AF_INET;
+            tv_addr.sin_port = htons(12345);
+            // Endereço de Broadcast (Manda para todos na rede)
+            tv_addr.sin_addr.s_addr = inet_addr("192.168.10.105"); 
+        } else {
+            ESP_LOGE(TAG, "Falha! O roteador nao respondeu. Desativando Modo TV.");
+            tv_mode_enabled = false; // Cancela o envio e liga a tela do relógio por segurança
+        }
+    }
+    // ------------------------------------------------------------------
+
     // Aloca os buffers de vídeo na SRAM interna
     if (!dma_buffer[0]) dma_buffer[0] = (uint16_t*)heap_caps_malloc(320 * SCALED_CHUNK_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!dma_buffer[1]) dma_buffer[1] = (uint16_t*)heap_caps_malloc(320 * SCALED_CHUNK_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
@@ -382,7 +472,16 @@ static void stop_game() {
     if (!emu_running) return;
 
     // 1. Sinaliza para TODAS as tasks pararem Imediatamente
-    emu_running = false; 
+    emu_running = false;
+
+    // --- DESLIGA O WI-FI SE ESTAVA NO MODO TV ---
+    if (tv_mode_enabled && udp_socket != -1) {
+        close(udp_socket);
+        udp_socket = -1;
+        esp_wifi_disconnect();
+        esp_wifi_stop();
+        esp_wifi_deinit();
+    }
 
     // 2. Aguarda a task do emulador (Vídeo/Lógica) terminar de forma segura
     while (emu_task_handle != NULL) { 
@@ -474,6 +573,19 @@ static void build_ui() {
     lv_label_set_text(lbl_audio, LV_SYMBOL_AUDIO);
     lv_obj_set_style_text_color(lbl_audio, lv_color_white(), 0);
     lv_obj_align_to(lbl_audio, sw_audio, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+
+    // --- NOVO: BOTÃO (SWITCH) DE MODO TV ---
+    lv_obj_t * sw_tv = lv_switch_create(scr_menu);
+    lv_obj_align(sw_tv, LV_ALIGN_TOP_RIGHT, -20, 70); // Fica abaixo do switch de áudio
+    lv_obj_add_event_cb(sw_tv, [](lv_event_t *e) {
+        lv_obj_t * sw = (lv_obj_t *)lv_event_get_target(e);
+        tv_mode_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    }, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    lv_obj_t * lbl_tv = lv_label_create(scr_menu);
+    lv_label_set_text(lbl_tv, LV_SYMBOL_WIFI " TV");
+    lv_obj_set_style_text_color(lbl_tv, lv_color_white(), 0);
+    lv_obj_align_to(lbl_tv, sw_tv, LV_ALIGN_OUT_LEFT_MID, -10, 0);
 
     // LISTA MAIS LARGA
     list_roms = lv_list_create(scr_menu);
