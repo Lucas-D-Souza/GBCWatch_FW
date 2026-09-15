@@ -350,10 +350,6 @@ static void start_game(const char* path) {
     if (tv_mode_enabled) {
         ESP_LOGI(TAG, "Iniciando Wi-Fi para o Modo TV...");
         
-        esp_netif_init();
-        esp_event_loop_create_default();
-        esp_netif_t *netif = esp_netif_create_default_wifi_sta();
-        
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         esp_wifi_init(&cfg);
         esp_wifi_set_mode(WIFI_MODE_STA);
@@ -370,6 +366,8 @@ static void start_game(const char* path) {
         
         ESP_LOGI(TAG, "Aguardando o roteador liberar o IP...");
         
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
         esp_netif_ip_info_t ip_info;
         ip_info.ip.addr = 0;
         int retries = 0;
@@ -377,7 +375,9 @@ static void start_game(const char* path) {
         // Fica preso aqui por no máximo 15 segundos esperando a rede
         while (ip_info.ip.addr == 0 && retries < 15) {
             vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_netif_get_ip_info(netif, &ip_info);
+            if (netif) {
+                esp_netif_get_ip_info(netif, &ip_info);
+            }
             retries++;
             if (retries % 5 == 0) esp_wifi_connect(); // Força reconexão se o roteador ignorar
             ESP_LOGI(TAG, "Tentativa %d de 15...", retries);
@@ -474,6 +474,12 @@ static void stop_game() {
     // 1. Sinaliza para TODAS as tasks pararem Imediatamente
     emu_running = false;
 
+    // 2. ESPERA TUDO PARAR PRIMEIRO!
+    while (emu_task_handle != NULL) { vTaskDelay(pdMS_TO_TICKS(10)); }
+    if (audio_enabled) {
+        while (audio_task_handle != NULL) { vTaskDelay(pdMS_TO_TICKS(10)); }
+    }
+
     // --- DESLIGA O WI-FI SE ESTAVA NO MODO TV ---
     if (tv_mode_enabled && udp_socket != -1) {
         close(udp_socket);
@@ -481,11 +487,6 @@ static void stop_game() {
         esp_wifi_disconnect();
         esp_wifi_stop();
         esp_wifi_deinit();
-    }
-
-    // 2. Aguarda a task do emulador (Vídeo/Lógica) terminar de forma segura
-    while (emu_task_handle != NULL) { 
-        vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 
     // 3. Aguarda a task de áudio terminar de ler o buffer e fechar
@@ -758,6 +759,10 @@ extern "C" void app_main(void) {
         nvs_flash_erase();
         nvs_flash_init();
     }
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
 
     bsp_display_start();
     bsp_display_lock(0);
