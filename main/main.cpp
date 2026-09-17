@@ -633,6 +633,8 @@ static void refresh_rom_list() {
 extern "C" void app_main(void) {
     clear_i2c_bus();
 
+    esp_ota_mark_app_valid_cancel_rollback();
+
     // Configuração do Botão BOOT
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
