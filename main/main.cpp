@@ -55,7 +55,8 @@ static void show_splash_screen(const char* version) {
     
     // TRUQUE LVGL v9: Escala a imagem via hardware para dobrar de tamanho (256 = 100%, 512 = 200%)
     // O seu icone de 50x50 vai ser renderizado como 100x100 pixels!
-    lv_image_set_scale(logo, 512); 
+    lv_image_set_scale(logo, 512);
+    lv_obj_set_size(logo, 100, 100);
 
     // 4. Texto GIGANTE do App
     lv_obj_t * title = lv_label_create(cont_center);
@@ -829,7 +830,7 @@ extern "C" void app_main(void) {
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
         build_ui();
         refresh_rom_list();
-        lv_scr_load_anim(scr_menu, LV_SCR_LOAD_ANIM_FADE_ON, 400, 1500, true);
+        lv_scr_load_anim(scr_menu, LV_SCR_LOAD_ANIM_FADE_ON, 400, 2000, true);
         bsp_display_unlock();
     }
 
