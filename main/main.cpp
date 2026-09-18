@@ -27,6 +27,54 @@ static bool tv_mode_enabled = false;
 static int udp_socket = -1;
 static struct sockaddr_in tv_addr;
 
+LV_IMAGE_DECLARE(icon_gbc); // Declara a imagem que você já tem compilada
+static lv_obj_t * scr_splash = NULL;
+
+static void show_splash_screen(const char* version) {
+    // 1. Cria a tela de Splash
+    scr_splash = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_splash, lv_color_black(), 0);
+    lv_obj_remove_flag(scr_splash, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 2. Container Transparente (Age como uma "Caixa" centralizando os itens juntos)
+    lv_obj_t * cont_center = lv_obj_create(scr_splash);
+    lv_obj_set_size(cont_center, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(cont_center, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_set_style_bg_opa(cont_center, LV_OPA_TRANSP, 0); // Transparente
+    lv_obj_set_style_border_width(cont_center, 0, 0); // Sem bordas
+    
+    // Configura o Flexbox: Coloca os itens Lado a Lado (Ícone na Esquerda, Texto na Direita)
+    lv_obj_set_flex_flow(cont_center, LV_FLEX_FLOW_ROW); 
+    lv_obj_set_flex_align(cont_center, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(cont_center, 0, 0);
+    lv_obj_set_style_pad_column(cont_center, 25, 0); // Espaço de 25px entre o Ícone e o Texto
+
+    // 3. Ícone do GBC
+    lv_obj_t * logo = lv_image_create(cont_center);
+    lv_image_set_src(logo, &icon_gbc);
+    
+    // TRUQUE LVGL v9: Escala a imagem via hardware para dobrar de tamanho (256 = 100%, 512 = 200%)
+    // O seu icone de 50x50 vai ser renderizado como 100x100 pixels!
+    lv_image_set_scale(logo, 512); 
+
+    // 4. Texto GIGANTE do App
+    lv_obj_t * title = lv_label_create(cont_center);
+    // Usamos a quebra de linha (\n) para o texto caber enorme sem estourar a tela
+    lv_label_set_text(title, "Game Boy\nColor"); 
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_30, 0); 
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+
+    // 5. Versão no rodapé
+    lv_obj_t * lbl_version = lv_label_create(scr_splash);
+    lv_label_set_text_fmt(lbl_version, "v%s", version);
+    lv_obj_set_style_text_font(lbl_version, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_version, lv_color_hex(0x555555), 0); // Cinza discreto
+    lv_obj_align(lbl_version, LV_ALIGN_BOTTOM_MID, 0, -25);
+
+    // 6. Joga imediatamente na tela sem animação
+    lv_screen_load(scr_splash);
+}
+
 // Globais da Bateria
 static lv_obj_t *icon_batt_warning = NULL;
 static bool has_low_batt_saved = false;
@@ -746,6 +794,8 @@ static void refresh_rom_list() {
 extern "C" void app_main(void) {
     clear_i2c_bus();
 
+    esp_ota_mark_app_valid_cancel_rollback();
+
     // Configuração do Botão BOOT
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -765,10 +815,13 @@ extern "C" void app_main(void) {
     esp_netif_create_default_wifi_sta();
 
     bsp_display_start();
-    bsp_display_lock(0);
-    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
-    bsp_display_unlock();
-    vTaskDelay(pdMS_TO_TICKS(100)); 
+    
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        // Chamamos a Splash passando a versão
+        show_splash_screen("1.0.0");
+        bsp_display_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
     bsp_display_brightness_set(80);
 
     SdUsbManager::get_instance().init_local_storage();
@@ -776,7 +829,7 @@ extern "C" void app_main(void) {
     if (bsp_display_lock(pdMS_TO_TICKS(100))) {
         build_ui();
         refresh_rom_list();
-        lv_screen_load(scr_menu);
+        lv_scr_load_anim(scr_menu, LV_SCR_LOAD_ANIM_FADE_ON, 400, 1500, true);
         bsp_display_unlock();
     }
 
