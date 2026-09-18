@@ -1,9 +1,11 @@
+file(GLOB icon_srcs "assets/icons/*.c")
 file(GLOB GNUBOY_SRCS "gnuboy/*.c")
 
 idf_component_register(
     SRCS 
         "main.cpp"
         "SdUsbManager.cpp"
+        ${icon_srcs}
         ${GNUBOY_SRCS}
     INCLUDE_DIRS 
         "."
